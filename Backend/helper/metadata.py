@@ -634,6 +634,17 @@ def _is_anime_channel(channel) -> bool:
     return any(str(c).strip().replace("-100", "") == target for c in anime_channels)
 
 
+#----- Map a video pixel height to a standard quality label
+def quality_from_height(height: int) -> str:
+    if not height:
+        return ""
+    for threshold, label in ((1800, "2160p"), (1200, "1440p"), (900, "1080p"),
+                             (620, "720p"), (400, "480p"), (260, "360p")):
+        if height >= threshold:
+            return label
+    return "240p"
+
+
 #----- Anime channels often use decorative captions that contain no
 #----- useful media metadata. For anime-indexed channels, prefer the
 #----- filename unless the caption contains parseable media metadata.
@@ -663,6 +674,8 @@ def resolve_media_name(message, channel) -> str:
         return file_name or caption or "video"
     else:
         return caption
+
+
 
 
 
@@ -789,7 +802,14 @@ async def fetch_movie_metadata(title, encoded_string, year=None, quality=None, d
 
 
 #----- ── Main entry point ────────────────────────────────────────────────────────
-async def metadata(filename: str, channel: int, msg_id, override_id: str = None) -> dict | None:
+async def metadata(
+    filename: str,
+    channel: int,
+    msg_id,
+    override_id: str = None,
+    height: int = 0,
+    file_name: str = None,
+) -> dict | None:
     if _MULTIPART_RE.search(filename):
         LOGGER.info(f"Skipping {filename}: split video file not meant to be combined in Stremio")
         return None
@@ -819,6 +839,16 @@ async def metadata(filename: str, channel: int, msg_id, override_id: str = None)
     episode = parsed.get("episode")
     year = parsed.get("year")
     quality = parsed.get("quality")
+
+    if not quality:
+        if file_name:
+            try:
+                parsed_file = parse_media_name(file_name)
+                quality = parsed_file.get("quality")
+            except Exception:
+                pass
+        if not quality and height:
+            quality = quality_from_height(height)
 
     if combined:
         season, episode = combined["season"], combined["start"] or 1

@@ -1,7 +1,7 @@
 import re
 from typing import Optional, Tuple
 
-from Backend.helper.metadata import parse_media_name, resolve_media_name
+from Backend.helper.metadata import parse_media_name, resolve_media_name, quality_from_height
 from Backend.helper.pyro import clean_filename, finalize_media_name, get_readable_file_size, is_media
 from Backend.helper.split_files import parse_split_info, strip_part_suffix
 
@@ -21,16 +21,6 @@ def parse_telegram_link(url: str) -> Tuple[Optional[object], Optional[int]]:
         return public.group(1), int(public.group(2))
     return None, None
 
-
-#----- Map a video pixel height to a standard quality label
-def quality_from_height(height: int) -> str:
-    if not height:
-        return ""
-    for threshold, label in ((1800, "2160p"), (1200, "1440p"), (900, "1080p"),
-                             (620, "720p"), (400, "480p"), (260, "360p")):
-        if height >= threshold:
-            return label
-    return "240p"
 
 
 #----- Fetch a message and return the stream fields the manual-add flow needs.

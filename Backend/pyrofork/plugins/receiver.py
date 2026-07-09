@@ -88,9 +88,15 @@ async def file_receive_handler(client: Client, message: Message):
             await message.reply_text("> Not supported")
             return
 
-        _, title, msg_id, raw_size, size, channel = _extract_fields(message)
+        file, title, msg_id, raw_size, size, channel = _extract_fields(message)
 
-        metadata_info = await metadata(clean_filename(title), int(channel), msg_id)
+        metadata_info = await metadata(
+            clean_filename(title),
+            int(channel),
+            msg_id,
+            height=getattr(file, "height", 0) or 0,
+            file_name=getattr(file, "file_name", None)
+        )
         if metadata_info is None:
             LOGGER.warning(f"Metadata failed for file: {title} (ID: {msg_id})")
             return
@@ -121,7 +127,7 @@ async def file_edited_handler(client: Client, message: Message):
         if not _is_supported_media(message):
             return
 
-        _, title, msg_id, raw_size, size, channel = _extract_fields(message)
+        file, title, msg_id, raw_size, size, channel = _extract_fields(message)
         override_id = extract_default_id(message.caption) if message.caption else None
         if not override_id:
             return
@@ -129,7 +135,14 @@ async def file_edited_handler(client: Client, message: Message):
         LOGGER.info(f"Detected override ID '{override_id}' in edited message {msg_id}")
         await db.remove_media_part(int(channel), msg_id)
 
-        metadata_info = await metadata(clean_filename(title), int(channel), msg_id, override_id=override_id)
+        metadata_info = await metadata(
+            clean_filename(title),
+            int(channel),
+            msg_id,
+            override_id=override_id,
+            height=getattr(file, "height", 0) or 0,
+            file_name=getattr(file, "file_name", None)
+        )
         if metadata_info is None:
             LOGGER.warning(f"Metadata failed for edited file: {title} (ID: {msg_id})")
             return
