@@ -637,12 +637,25 @@ def _is_anime_channel(channel) -> bool:
 #----- Map a video pixel height to a standard quality label
 def quality_from_height(height: int) -> str:
     if not height:
-        return ""
+        return "720p"
     for threshold, label in ((1800, "2160p"), (1200, "1440p"), (900, "1080p"),
                              (620, "720p"), (400, "480p"), (260, "360p")):
         if height >= threshold:
             return label
-    return "240p"
+    return "720p"
+
+
+def _rewrite_one_piece_pattern(name: str) -> str:
+    if not name:
+        return name
+    from Backend.helper.pyro import _CHANNEL_TAG_PATTERN
+    temp = _CHANNEL_TAG_PATTERN.sub("", name).strip()
+    match = re.match(r"^(\d+)\s*[_\s-]*[Oo]ne\s*[Pp]iece\b(.*)$", temp, re.IGNORECASE)
+    if match:
+        episode_num = match.group(1)
+        rest = match.group(2)
+        return f"One Piece Episode {episode_num}{rest}"
+    return name
 
 
 #----- Anime channels often use decorative captions that contain no
@@ -656,12 +669,12 @@ def resolve_media_name(message, channel) -> str:
     caption = (getattr(message, "caption", None) or "").strip()
 
     if not caption:
-        return file_name or "video"
+        return _rewrite_one_piece_pattern(file_name) or "video"
 
     if _is_anime_channel(channel):
         cleaned_caption = clean_filename(caption)
         if not cleaned_caption or cleaned_caption == "unknown_file":
-            return file_name or caption or "video"
+            return _rewrite_one_piece_pattern(file_name or caption) or "video"
 
         parsed = parse_media_name(cleaned_caption)
         if (
@@ -671,9 +684,10 @@ def resolve_media_name(message, channel) -> str:
         ):
             return caption
 
-        return file_name or caption or "video"
+        return _rewrite_one_piece_pattern(file_name or caption) or "video"
     else:
         return caption
+
 
 
 
@@ -849,6 +863,8 @@ async def metadata(
                 pass
         if not quality and height:
             quality = quality_from_height(height)
+        if not quality:
+            quality = "720p"
 
     if combined:
         season, episode = combined["season"], combined["start"] or 1
