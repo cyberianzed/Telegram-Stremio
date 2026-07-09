@@ -788,6 +788,33 @@ async def metadata(filename: str, channel: int, msg_id, override_id: str = None)
     year = parsed.get("year")
     quality = parsed.get("quality")
 
+    anime_channel = _is_anime_channel(channel)
+
+    #----- Normalise One Piece absolute episodes on anime channels to TV routing
+    if anime_channel and not combined:
+        normalized_fn = re.sub(r"[._-]+", " ", parse_target.lower())
+        if "one piece" in normalized_fn:
+            match_before = re.search(r"\b(1\d{3})\s+one\s+piece\b", normalized_fn)
+            match_after = re.search(r"\bone\s+piece\b.*?\b(?:ep|episode\b)?\s*(1\d{3})\b", normalized_fn)
+            
+            ep_num = None
+            if match_before:
+                ep_num = int(match_before.group(1))
+            elif match_after:
+                ep_num = int(match_after.group(1))
+            else:
+                match_fallback = re.search(r"\bone\s+piece\b\s*(?:ep|episode\b)?\s*(1\d{3})\b", normalized_fn)
+                if match_fallback:
+                    ep_num = int(match_fallback.group(1))
+            
+            if ep_num is not None and 1000 <= ep_num <= 2000:
+                title = "One Piece"
+                season = 1
+                episode = ep_num
+                parsed["title"] = title
+                parsed["season"] = season
+                parsed["episode"] = episode
+
     if combined:
         season, episode = combined["season"], combined["start"] or 1
     elif isinstance(season, list) or isinstance(episode, list):
@@ -812,7 +839,7 @@ async def metadata(filename: str, channel: int, msg_id, override_id: str = None)
         encoded_string = None
 
     group_key = f"{channel}:{quality}:{split_info[0]}" if split_info else None
-    anime_channel = _is_anime_channel(channel)
+
 
     try:
         if season and episode:
