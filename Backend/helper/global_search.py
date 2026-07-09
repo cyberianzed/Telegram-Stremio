@@ -20,6 +20,7 @@ from Backend.logger import LOGGER
 from Backend.helper.settings_manager import SettingsManager
 from Backend.helper.encrypt import encode_string
 from Backend.helper.pyro import get_readable_file_size
+from Backend.helper.metadata import resolve_media_name
 from Backend.pyrofork.bot import Userbot
 
 MAX_RESULTS = 50
@@ -97,12 +98,12 @@ def _parse_and_validate(filename: str, expected_title: str, season: Optional[int
 
 def _video_filename(message) -> Optional[str]:
     if message.video:
-        return (message.caption or "").strip() or getattr(message.video, "file_name", None) or "video.mkv"
+        return resolve_media_name(message, message.chat.id) or "video.mkv"
     if message.document:
         mime = message.document.mime_type or ""
         name = message.document.file_name
         if mime.startswith("video/") or (name and name.lower().endswith(_VIDEO_EXTS)):
-            return (message.caption or "").strip() or name or "video.mkv"
+            return resolve_media_name(message, message.chat.id) or name or "video.mkv"
     return None
 
 

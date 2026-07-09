@@ -634,6 +634,38 @@ def _is_anime_channel(channel) -> bool:
     return any(str(c).strip().replace("-100", "") == target for c in anime_channels)
 
 
+#----- Anime channels often use decorative captions that contain no
+#----- useful media metadata. For anime-indexed channels, prefer the
+#----- filename unless the caption contains parseable media metadata.
+#----- Non-anime channels retain the original caption-first behaviour.
+def resolve_media_name(message, channel) -> str:
+    from Backend.helper.pyro import clean_filename, is_media
+    media = is_media(message)
+    file_name = getattr(media, "file_name", None) or ""
+    caption = (getattr(message, "caption", None) or "").strip()
+
+    if not caption:
+        return file_name or "video"
+
+    if _is_anime_channel(channel):
+        cleaned_caption = clean_filename(caption)
+        if not cleaned_caption or cleaned_caption == "unknown_file":
+            return file_name or caption or "video"
+
+        parsed = parse_media_name(cleaned_caption)
+        if (
+            parsed.get("episode") is not None
+            or parsed.get("season") is not None
+            or parsed.get("year") is not None
+        ):
+            return caption
+
+        return file_name or caption or "video"
+    else:
+        return caption
+
+
+
 async def _fetch_anime_tv(title, season, episode, encoded_string, year, quality) -> dict | None:
     try:
         result = await fetch_anime_metadata(title, season, episode, encoded_string, year, quality)

@@ -8,7 +8,7 @@ from pyrogram.errors import FloodWait, ChannelPrivate, ChatAdminRequired
 
 from Backend.logger import LOGGER
 from Backend.helper.encrypt import encode_string, decode_string
-from Backend.helper.metadata import metadata
+from Backend.helper.metadata import metadata, resolve_media_name
 from Backend.helper.pyro import clean_filename, get_readable_file_size, remove_urls
 from Backend.helper.split_files import parse_split_info, strip_part_suffix
 
@@ -442,7 +442,7 @@ class ScanManager:
             return
 
         file = message.video or message.document
-        title = message.caption or file.file_name
+        title = resolve_media_name(message, chat_id)
         msg_id = message.id
         raw_size = file.file_size
         size = get_readable_file_size(file.file_size)
