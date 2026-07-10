@@ -46,8 +46,12 @@ def _is_manual_channel(chat_id) -> bool:
 #----- Common message field extraction shared by the channel handlers
 def _extract_fields(message: Message):
     file = message.video or message.document
-    title = message.caption or file.file_name
     channel = str(message.chat.id).replace("-100", "")
+    from Backend.helper.metadata import _is_anime_channel
+    if _is_anime_channel(message.chat.id):
+        title = file.file_name or message.caption or "video"
+    else:
+        title = message.caption or file.file_name or "video"
     return file, title, message.id, file.file_size, get_readable_file_size(file.file_size), channel
 
 
@@ -103,9 +107,46 @@ async def file_receive_handler(client: Client, message: Message):
             await message.reply_text("> Not supported")
             return
 
-        _, title, msg_id, raw_size, size, channel = _extract_fields(message)
+        file, title, msg_id, raw_size, size, channel = _extract_fields(message)
+        from Backend.helper.metadata import _is_anime_channel
+        
+        if _is_anime_channel(message.chat.id):
+            from Backend.helper.anime_parser import parse_anime_message
+            from Backend.helper.anime_mapping import map_tvdb
+            from Backend.helper.anime import search_anime
 
-        metadata_info = await metadata(clean_filename(title), int(channel), msg_id)
+            parsed = parse_anime_message(file.file_name, message.caption)
+            title_val = parsed["title"]
+            abs_ep = parsed["absolute_episode"]
+            anilist_id = None
+            if abs_ep is not None and title_val.lower() != "one piece":
+                try:
+                    media_info = await search_anime(title_val)
+                    if media_info:
+                        anilist_id = media_info.get("id")
+                except Exception as e:
+                    LOGGER.warning(f"Failed to lookup AniList ID for '{title_val}': {e}")
+            
+            season_val = 1
+            episode_val = abs_ep or 1
+            if abs_ep is not None:
+                mapped = map_tvdb(title_val, abs_ep, anilist_id=anilist_id)
+                if mapped:
+                    season_val, episode_val = mapped
+            
+            parsed_arg = {
+                "title": title_val,
+                "season": season_val,
+                "episode": episode_val,
+                "quality": parsed["quality"],
+                "year": parsed["year"],
+                "absolute_episode": abs_ep
+            }
+            meta_filename = file.file_name or title
+            metadata_info = await metadata(clean_filename(meta_filename), int(channel), msg_id, parsed=parsed_arg)
+        else:
+            metadata_info = await metadata(clean_filename(title), int(channel), msg_id)
+
         if metadata_info is None:
             LOGGER.warning(f"Metadata failed for file: {title} (ID: {msg_id})")
             return
@@ -136,15 +177,51 @@ async def file_edited_handler(client: Client, message: Message):
         if not _is_supported_media(message):
             return
 
-        _, title, msg_id, raw_size, size, channel = _extract_fields(message)
+        file, title, msg_id, raw_size, size, channel = _extract_fields(message)
         override_id = extract_default_id(message.caption) if message.caption else None
         if not override_id:
             return
 
         LOGGER.info(f"Detected override ID '{override_id}' in edited message {msg_id}")
         await db.remove_media_part(int(channel), msg_id)
+        from Backend.helper.metadata import _is_anime_channel
 
-        metadata_info = await metadata(clean_filename(title), int(channel), msg_id, override_id=override_id)
+        if _is_anime_channel(message.chat.id):
+            from Backend.helper.anime_parser import parse_anime_message
+            from Backend.helper.anime_mapping import map_tvdb
+            from Backend.helper.anime import search_anime
+
+            parsed = parse_anime_message(file.file_name, message.caption)
+            title_val = parsed["title"]
+            abs_ep = parsed["absolute_episode"]
+            anilist_id = None
+            if abs_ep is not None and title_val.lower() != "one piece":
+                try:
+                    media_info = await search_anime(title_val)
+                    if media_info:
+                        anilist_id = media_info.get("id")
+                except Exception as e:
+                    LOGGER.warning(f"Failed to lookup AniList ID for '{title_val}': {e}")
+            
+            season_val = 1
+            episode_val = abs_ep or 1
+            if abs_ep is not None:
+                mapped = map_tvdb(title_val, abs_ep, anilist_id=anilist_id)
+                if mapped:
+                    season_val, episode_val = mapped
+            
+            parsed_arg = {
+                "title": title_val,
+                "season": season_val,
+                "episode": episode_val,
+                "quality": parsed["quality"],
+                "year": parsed["year"],
+                "absolute_episode": abs_ep
+            }
+            meta_filename = file.file_name or title
+            metadata_info = await metadata(clean_filename(meta_filename), int(channel), msg_id, override_id=override_id, parsed=parsed_arg)
+        else:
+            metadata_info = await metadata(clean_filename(title), int(channel), msg_id, override_id=override_id)
         if metadata_info is None:
             LOGGER.warning(f"Metadata failed for edited file: {title} (ID: {msg_id})")
             return

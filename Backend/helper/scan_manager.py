@@ -457,11 +457,17 @@ class ScanManager:
             return
 
         file = message.video or message.document
-        title = message.caption or file.file_name
+        channel_int = int(str(chat_id).replace("-100", ""))
+        from Backend.helper.metadata import _is_anime_channel
+        
+        if _is_anime_channel(channel_int):
+            title = file.file_name or message.caption or "video"
+        else:
+            title = message.caption or file.file_name or "video"
+            
         msg_id = message.id
         raw_size = file.file_size
         size = get_readable_file_size(file.file_size)
-        channel_int = int(str(chat_id).replace("-100", ""))
 
         try:
             if await self._stream_id_exists(channel_int, msg_id):
@@ -471,7 +477,42 @@ class ScanManager:
             LOGGER.warning(f"[ScanManager] Dup-check error msg {msg_id}: {e}")
 
         try:
-            metadata_info = await metadata(clean_filename(title), channel_int, msg_id)
+            if _is_anime_channel(channel_int):
+                from Backend.helper.anime_parser import parse_anime_message
+                from Backend.helper.anime_mapping import map_tvdb
+                from Backend.helper.anime import search_anime
+
+                parsed = parse_anime_message(file.file_name, message.caption)
+                title_val = parsed["title"]
+                abs_ep = parsed["absolute_episode"]
+                anilist_id = None
+                if abs_ep is not None and title_val.lower() != "one piece":
+                    try:
+                        media_info = await search_anime(title_val)
+                        if media_info:
+                            anilist_id = media_info.get("id")
+                    except Exception as e:
+                        LOGGER.warning(f"Failed to lookup AniList ID for '{title_val}': {e}")
+                
+                season_val = 1
+                episode_val = abs_ep or 1
+                if abs_ep is not None:
+                    mapped = map_tvdb(title_val, abs_ep, anilist_id=anilist_id)
+                    if mapped:
+                        season_val, episode_val = mapped
+                
+                parsed_arg = {
+                    "title": title_val,
+                    "season": season_val,
+                    "episode": episode_val,
+                    "quality": parsed["quality"],
+                    "year": parsed["year"],
+                    "absolute_episode": abs_ep
+                }
+                meta_filename = file.file_name or title
+                metadata_info = await metadata(clean_filename(meta_filename), channel_int, msg_id, parsed=parsed_arg)
+            else:
+                metadata_info = await metadata(clean_filename(title), channel_int, msg_id)
         except Exception as e:
             LOGGER.warning(f"[ScanManager] Metadata exception for msg {msg_id}: {e}")
             metadata_info = None

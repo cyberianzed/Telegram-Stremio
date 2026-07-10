@@ -56,12 +56,50 @@ async def resolve_telegram_message(client, url: str = None, chat_id=None, msg_id
     #----- Prefer the caption over the raw file name, then normalise it to the exact
     #----- filename receiver.py stores (clean, split-suffix stripped, video extension).
     caption = (getattr(message, "caption", None) or "").strip()
-    raw_name = caption or getattr(media, "file_name", None) or "video"
+    from Backend.helper.metadata import _is_anime_channel
+    
+    if _is_anime_channel(message.chat.id):
+        raw_name = getattr(media, "file_name", None) or caption or "video"
+    else:
+        raw_name = caption or getattr(media, "file_name", None) or "video"
+        
     cleaned = clean_filename(raw_name)
     split_info = parse_split_info(cleaned)
     raw_size = getattr(media, "file_size", 0) or 0
-    parsed = parse_media_name(strip_part_suffix(cleaned) if split_info else cleaned)
     file_name = finalize_media_name(raw_name, bool(split_info))
+
+    if _is_anime_channel(message.chat.id):
+        from Backend.helper.anime_parser import parse_anime_message
+        from Backend.helper.anime_mapping import map_tvdb
+        from Backend.helper.anime import search_anime
+
+        raw_file_name = getattr(media, "file_name", None) or "video"
+        parsed_anime = parse_anime_message(raw_file_name, caption)
+        title_val = parsed_anime["title"]
+        abs_ep = parsed_anime["absolute_episode"]
+        anilist_id = None
+        if abs_ep is not None and title_val.lower() != "one piece":
+            try:
+                media_info = await search_anime(title_val)
+                if media_info:
+                    anilist_id = media_info.get("id")
+            except Exception as e:
+                LOGGER.warning(f"Failed to lookup AniList ID for '{title_val}': {e}")
+        
+        season_val = 1
+        episode_val = abs_ep or 1
+        if abs_ep is not None:
+            mapped = map_tvdb(title_val, abs_ep, anilist_id=anilist_id)
+            if mapped:
+                season_val, episode_val = mapped
+                
+        parsed = {
+            "season": season_val,
+            "episode": episode_val,
+            "quality": parsed_anime["quality"]
+        }
+    else:
+        parsed = parse_media_name(strip_part_suffix(cleaned) if split_info else cleaned)
 
     #----- Real video dimensions beat the filename; documents fall back to the name
     height = getattr(media, "height", 0) or 0
