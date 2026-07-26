@@ -15,12 +15,19 @@ from Backend.fastapi.routes.api_routes import (
     auto_catalog_sync_status_api,
     auto_sync_custom_catalogs_api,
     cancel_dbcheck_api,
+    cancel_duplicate_check_api,
     cancel_scan_api,
     clear_cache_api,
     clear_stream_analytics_api,
     create_custom_catalog_api,
     create_token_api,
+    grant_lifetime_api,
+    set_token_lifetime_api,
+    set_token_expiry_api,
+    subscription_preflight_api,
+    backfill_subscriber_names_api,
     dbcheck_status_api,
+    duplicate_check_status_api,
     delete_custom_catalog_api,
     delete_media_api,
     delete_movie_quality_api,
@@ -48,8 +55,15 @@ from Backend.fastapi.routes.api_routes import (
     get_subscription_plans_api,
     get_settings_api,
     get_logs_api,
+    get_manual_session_api,
     get_system_stats_api,
     get_tools_channels_api,
+    bot_admin_scan_api,
+    bot_admin_apply_api,
+    bot_admin_apply_status_api,
+    clear_manual_session_api,
+    search_manual_session_api,
+    set_manual_session_api,
     health_api,
     health_report_api,
     setup_status_api,
@@ -58,9 +72,17 @@ from Backend.fastapi.routes.api_routes import (
     list_media_api,
     manage_subscriber_api,
     manual_add_media_api,
+    list_manual_add_catalogs_api,
+    resolve_manual_metadata_api,
     purge_dead_links_api,
+    purge_duplicates_api,
     remove_custom_catalog_item_api,
     resolve_telegram_api,
+    resolve_subtitle_api,
+    list_subtitle_languages_api,
+    list_subtitles_api,
+    add_subtitles_api,
+    remove_subtitle_api,
     restart_app_api,
     revoke_token_api,
     scan_status_api,
@@ -70,6 +92,7 @@ from Backend.fastapi.routes.api_routes import (
     speed_test_api,
     speed_test_stream_api,
     start_dbcheck_api,
+    start_duplicate_check_api,
     start_scan_api,
     update_auto_catalog_settings_api,
     update_custom_catalog_api,
@@ -173,8 +196,8 @@ async def admin_dashboard(request: Request, _: bool = Depends(require_auth)):
     return await admin_dashboard_page(request, _)
 
 @app.get("/media/manage", response_class=HTMLResponse)
-async def media_management(request: Request, media_type: str = "movie", _: bool = Depends(require_auth)):
-    return await media_management_page(request, media_type, _)
+async def media_management(request: Request, media_type: str = "movie", custom: bool = False, _: bool = Depends(require_auth)):
+    return await media_management_page(request, media_type, custom, _)
 
 @app.get("/catalogs", response_class=HTMLResponse)
 async def custom_catalogs(request: Request, _: bool = Depends(require_auth)):
@@ -190,9 +213,10 @@ async def list_media(
     page: int = Query(1, ge=1),
     page_size: int = Query(24, ge=1, le=100),
     search: str = Query("", max_length=100),
+    custom: bool = Query(False),
     _: bool = Depends(require_auth)
 ):
-    return await list_media_api(media_type, page, page_size, search)
+    return await list_media_api(media_type, page, page_size, search, custom)
 
 @app.delete("/api/media/delete")
 async def delete_media(tmdb_id: int, db_index: int, media_type: str, _: bool = Depends(require_auth)):
@@ -315,6 +339,26 @@ async def link_token_to_user(token: str, payload: dict, _: bool = Depends(requir
         raise HTTPException(status_code=400, detail="user_id is required.")
     return await link_token_user_api(token, user_id)
 
+@app.patch("/api/admin/access/tokens/{token}/lifetime")
+async def set_token_lifetime(token: str, payload: dict, _: bool = Depends(require_auth)):
+    return await set_token_lifetime_api(token, payload)
+
+@app.post("/api/admin/access/tokens/{token}/expiry")
+async def set_token_expiry(token: str, payload: dict, _: bool = Depends(require_auth)):
+    return await set_token_expiry_api(token, payload)
+
+@app.post("/api/admin/access/grant-lifetime")
+async def grant_lifetime(_: bool = Depends(require_auth)):
+    return await grant_lifetime_api()
+
+@app.get("/api/admin/subscriptions/preflight")
+async def subscription_preflight(_: bool = Depends(require_auth)):
+    return await subscription_preflight_api()
+
+@app.post("/api/admin/subscriptions/backfill-names")
+async def backfill_subscriber_names(_: bool = Depends(require_auth)):
+    return await backfill_subscriber_names_api()
+
 
 #----- Public content request page (no auth)
 @app.get("/request", response_class=HTMLResponse)
@@ -400,6 +444,36 @@ async def resolve_telegram(payload: dict, _: bool = Depends(require_auth)):
 @app.post("/api/media/manual-add")
 async def manual_add_media(payload: dict, _: bool = Depends(require_auth)):
     return await manual_add_media_api(payload)
+
+@app.get("/api/media/manual-add/catalogs")
+async def manual_add_catalogs(_: bool = Depends(require_auth)):
+    return await list_manual_add_catalogs_api()
+
+@app.get("/api/media/manual-add/resolve-meta")
+async def manual_add_resolve_meta(media_type: str, selected_id: str, _: bool = Depends(require_auth)):
+    return await resolve_manual_metadata_api(media_type, selected_id)
+
+
+#----- Manual subtitle management
+@app.get("/api/media/subtitles/languages")
+async def subtitle_languages(_: bool = Depends(require_auth)):
+    return list_subtitle_languages_api()
+
+@app.get("/api/media/subtitles")
+async def list_subtitles(media_type: str, tmdb_id: int, db_index: int, _: bool = Depends(require_auth)):
+    return await list_subtitles_api(media_type, tmdb_id, db_index)
+
+@app.post("/api/media/subtitles/resolve")
+async def resolve_subtitle(payload: dict, _: bool = Depends(require_auth)):
+    return await resolve_subtitle_api(payload)
+
+@app.post("/api/media/subtitles/add")
+async def add_subtitles(payload: dict, _: bool = Depends(require_auth)):
+    return await add_subtitles_api(payload)
+
+@app.post("/api/media/subtitles/remove")
+async def remove_subtitle_route(payload: dict, _: bool = Depends(require_auth)):
+    return await remove_subtitle_api(payload)
 
 
 #----- Custom catalog management
@@ -557,6 +631,34 @@ async def admin_tools(request: Request, _: bool = Depends(require_auth)):
 async def tools_channels(_: bool = Depends(require_auth)):
     return await get_tools_channels_api()
 
+@app.get("/api/admin/tools/bot-admin/scan")
+async def tools_bot_admin_scan(_: bool = Depends(require_auth)):
+    return await bot_admin_scan_api()
+
+@app.post("/api/admin/tools/bot-admin/apply")
+async def tools_bot_admin_apply(payload: dict, _: bool = Depends(require_auth)):
+    return await bot_admin_apply_api(payload)
+
+@app.get("/api/admin/tools/bot-admin/apply/status")
+async def tools_bot_admin_apply_status(_: bool = Depends(require_auth)):
+    return await bot_admin_apply_status_api()
+
+@app.get("/api/admin/tools/manual-session")
+async def tools_manual_session_get(_: bool = Depends(require_auth)):
+    return await get_manual_session_api()
+
+@app.get("/api/admin/tools/manual-session/search")
+async def tools_manual_session_search(query: str = Query(""), _: bool = Depends(require_auth)):
+    return await search_manual_session_api(query)
+
+@app.post("/api/admin/tools/manual-session")
+async def tools_manual_session_set(payload: dict, _: bool = Depends(require_auth)):
+    return await set_manual_session_api(payload)
+
+@app.delete("/api/admin/tools/manual-session")
+async def tools_manual_session_clear(_: bool = Depends(require_auth)):
+    return await clear_manual_session_api()
+
 @app.post("/api/admin/tools/scan/start")
 async def tools_scan_start(payload: dict, _: bool = Depends(require_auth)):
     return await start_scan_api(payload)
@@ -584,6 +686,22 @@ async def tools_dbcheck_status(_: bool = Depends(require_auth)):
 @app.post("/api/admin/tools/dead-links/purge")
 async def tools_purge_dead_links(payload: dict | None = None, _: bool = Depends(require_auth)):
     return await purge_dead_links_api(payload)
+
+@app.post("/api/admin/tools/duplicates/start")
+async def tools_duplicates_start(_: bool = Depends(require_auth)):
+    return await start_duplicate_check_api()
+
+@app.post("/api/admin/tools/duplicates/cancel")
+async def tools_duplicates_cancel(_: bool = Depends(require_auth)):
+    return await cancel_duplicate_check_api()
+
+@app.get("/api/admin/tools/duplicates/status")
+async def tools_duplicates_status(_: bool = Depends(require_auth)):
+    return await duplicate_check_status_api()
+
+@app.post("/api/admin/tools/duplicates/purge")
+async def tools_duplicates_purge(payload: dict | None = None, _: bool = Depends(require_auth)):
+    return await purge_duplicates_api(payload)
 
 
 @app.exception_handler(401)

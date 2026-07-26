@@ -2,7 +2,7 @@ import re
 from typing import Optional, Tuple
 
 _VIDEO_EXTENSIONS = r'mkv|mp4|avi|ts|m4v|mov|wmv|webm|flv|m2ts|mpg|mpeg'
-_TRAILING_NUMERIC_PATTERN = re.compile(rf'(?i)\.({_VIDEO_EXTENSIONS})\.(\d{{2,3}})$')
+_TRAILING_NUMERIC_PATTERN = re.compile(rf'(?i)\.({_VIDEO_EXTENSIONS})\.(\d{{2,3}})(?=$|\D)')
 _NORMALIZE_RE = re.compile(r'[\.\-_ ]+')
 
 
@@ -65,6 +65,15 @@ def parse_combined_episodes(filename: str) -> Optional[dict]:
             return {"season": season, "start": None, "end": None}
 
     return None
+
+
+#----- Stable grouping key for combined files (episode range/keyword removed)
+def combined_name_key(filename: str) -> str:
+    if not filename:
+        return ""
+    name = _COMBINED_EPISODES_RE.sub("", filename)
+    name = _COMBINED_KEYWORD_RE.sub("", name)
+    return re.sub(r"[\s._-]+", " ", name).strip().lower()
 
 
 #----- Remove a trailing split-part suffix from a filename

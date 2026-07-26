@@ -10,6 +10,7 @@ from Backend.logger import LOGGER
 #----- Default values (used when nothing exists in the DB yet)
 _DEFAULTS: Dict[str, Any] = {
     "replace_mode": True,
+    "duplicate_protection": False,
     "hide_catalog": False,
     "auth_channels": [],
     "tmdb_api": "",
@@ -26,6 +27,8 @@ _DEFAULTS: Dict[str, Any] = {
     "payment_qr_url": "",
     "http_proxy_url": "",
     "show_proxy_and_non_proxy_both": False,
+    "mediaflow_proxy": False,
+    "mediaflow_password": "",
     "multi_tokens": [],
     "extra_databases": [],
     "global_search": False,
@@ -34,6 +37,17 @@ _DEFAULTS: Dict[str, Any] = {
     "manual_channels": [],
     "announce_new_content": False,
     "announcement_channel": "",
+    "skip_channel": "",
+    "delete_on_metadata_fail": False,
+    "better_poster_enabled": False,
+    "better_poster": "",
+    "rpdb_enabled": False,
+    "rpdb_api_key": "",
+    "fanart_enabled": False,
+    "fanart_api_key": "",
+    "fanart_shuffle": False,
+    "fanart_shuffle_interval": 5,
+    "fanart_low_res_poster": True,
 }
 
 
@@ -78,6 +92,10 @@ class Settings:
         return bool(self._d["replace_mode"])
 
     @property
+    def duplicate_protection(self) -> bool:
+        return bool(self._d.get("duplicate_protection", False))
+
+    @property
     def hide_catalog(self) -> bool:
         return bool(self._d["hide_catalog"])
 
@@ -88,6 +106,10 @@ class Settings:
     @property
     def show_proxy_and_non_proxy_both(self) -> bool:
         return bool(self._d["show_proxy_and_non_proxy_both"])
+
+    @property
+    def mediaflow_proxy(self) -> bool:
+        return bool(self._d.get("mediaflow_proxy", False))
 
     @property
     def global_search(self) -> bool:
@@ -110,8 +132,16 @@ class Settings:
         return bool(self._d.get("announce_new_content", False))
 
     @property
+    def delete_on_metadata_fail(self) -> bool:
+        return bool(self._d.get("delete_on_metadata_fail", False))
+
+    @property
     def announcement_channel(self) -> str:
         return str(self._d.get("announcement_channel") or "").strip()
+
+    @property
+    def skip_channel(self) -> str:
+        return str(self._d.get("skip_channel") or "").strip()
 
     #----- Strings
     @property
@@ -147,6 +177,10 @@ class Settings:
         return str(self._d.get("http_proxy_url") or "")
 
     @property
+    def mediaflow_password(self) -> str:
+        return str(self._d.get("mediaflow_password") or "")
+
+    @property
     def payment_instructions(self) -> str:
         return str(self._d.get("payment_instructions") or "")
 
@@ -154,10 +188,49 @@ class Settings:
     def payment_qr_url(self) -> str:
         return str(self._d.get("payment_qr_url") or "")
 
+    @property
+    def better_poster_enabled(self) -> bool:
+        return bool(self._d.get("better_poster_enabled", False))
+
+    @property
+    def better_poster(self) -> str:
+        return str(self._d.get("better_poster") or "").strip()
+
+    @property
+    def rpdb_enabled(self) -> bool:
+        return bool(self._d.get("rpdb_enabled", False))
+
+    @property
+    def rpdb_api_key(self) -> str:
+        return str(self._d.get("rpdb_api_key") or "").strip()
+
+    @property
+    def fanart_enabled(self) -> bool:
+        return bool(self._d.get("fanart_enabled", False))
+
+    @property
+    def fanart_api_key(self) -> str:
+        return str(self._d.get("fanart_api_key") or "").strip()
+
+    @property
+    def fanart_shuffle(self) -> bool:
+        return bool(self._d.get("fanart_shuffle", False))
+
+    @property
+    def fanart_low_res_poster(self) -> bool:
+        return bool(self._d.get("fanart_low_res_poster", True))
+
     #----- Integers
     @property
     def subscription_group_id(self) -> int:
         return int(self._d.get("subscription_group_id") or 0)
+
+    @property
+    def fanart_shuffle_interval(self) -> int:
+        try:
+            return max(0, int(self._d.get("fanart_shuffle_interval", 5)))
+        except (ValueError, TypeError):
+            return 5
 
     #----- Lists
     @property
@@ -284,7 +357,7 @@ class SettingsManager:
             results["auth_channels"] = f"{len(new_channels)} channel(s) saved"
 
         #----- Proxy settings changed
-        proxy_keys = {"http_proxy_url", "show_proxy_and_non_proxy_both"}
+        proxy_keys = {"http_proxy_url", "show_proxy_and_non_proxy_both", "mediaflow_proxy", "mediaflow_password"}
         if any(old.get(k) != new.get(k) for k in proxy_keys):
             results["proxy"] = "updated — applies to next outbound request"
 

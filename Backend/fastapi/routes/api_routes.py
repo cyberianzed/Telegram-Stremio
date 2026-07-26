@@ -10,7 +10,11 @@ from time import time
 
 from fastapi import HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
+from pyrogram.enums import ChatMemberStatus, ChatMembersFilter
+from pyrogram.errors import FloodWait
+from pyrogram.types import ChatPrivileges
 
+import Backend
 from Backend import StartTime, __version__, db
 from Backend.fastapi.routes.stream_routes import _streamer_by_client
 from Backend.fastapi.routes.stremio_routes import invalidate_membership_cache
@@ -25,7 +29,7 @@ from Backend.helper.backup import export_config, import_config
 from Backend.helper.custom_dl import ByteStreamer, _speed_test_single_client, run_speed_test
 from Backend.helper.encrypt import decode_string, encode_string
 from Backend.helper.health import run_health_checks
-from Backend.helper.manual_add import resolve_telegram_message
+from Backend.helper.manual_add import resolve_telegram_message, stamp_caption_by_ref
 from Backend.helper.requests_manager import (
     delete_request,
     list_requests,
@@ -35,21 +39,31 @@ from Backend.helper.requests_manager import (
     submit_request,
 )
 from Backend.helper.metadata import (
+    extract_default_id,
     fetch_selected_movie_metadata,
     fetch_selected_tv_metadata,
     gradient_cover_path,
     resolve_cover_url,
+    search_any_candidates,
     search_movie_candidates,
     search_tv_candidates,
 )
 from Backend.helper.passwords import hash_password, verify_password
 from Backend.helper.pyro import get_readable_file_size, get_readable_time
-from Backend.helper.scan_manager import dbcheck_manager, scan_manager
+from Backend.helper.scan_manager import dbcheck_manager, duplicate_manager, scan_manager
 from Backend.helper.settings_manager import SettingsManager
 from Backend.helper.split_files import strip_part_suffix
+from Backend.helper.subtitles import (
+    list_languages,
+    list_title_subtitles,
+    manual_ingest_subtitle,
+    remove_subtitle,
+    resolve_subtitle_message,
+)
 from Backend.logger import LOGGER
 from Backend.pyrofork.bot import (
     StreamBot,
+    Userbot,
     client_avg_mbps,
     client_dc_map,
     client_failures,
@@ -99,13 +113,19 @@ async def list_media_api(
     media_type: str = Query("movie", regex="^(movie|tv)$"),
     page: int = Query(1, ge=1),
     page_size: int = Query(24, ge=1, le=100),
-    search: str = Query("", max_length=100)
+    search: str = Query("", max_length=100),
+    custom: bool = Query(False)
 ):
     try:
         key = "movies" if media_type == "movie" else "tv_shows"
+        #----- Custom (manually added) titles carry a negative synthetic tmdb_id
+        extra_filter = {"tmdb_id": {"$lt": 0}} if custom else None
         if search:
             result = await db.search_documents(search, page, page_size)
-            filtered_results = [item for item in result['results'] if item.get('media_type') == media_type]
+            filtered_results = [
+                item for item in result['results']
+                if item.get('media_type') == media_type and (not custom or int(item.get('tmdb_id') or 0) < 0)
+            ]
             total_filtered = len(filtered_results)
             start_index = (page - 1) * page_size
             resp = {
@@ -115,9 +135,9 @@ async def list_media_api(
                 key: filtered_results[start_index:start_index + page_size],
             }
         elif media_type == "movie":
-            resp = await db.sort_movies([], page, page_size)
+            resp = await db.sort_movies([], page, page_size, extra_filter=extra_filter)
         else:
-            resp = await db.sort_tv_shows([], page, page_size)
+            resp = await db.sort_tv_shows([], page, page_size, extra_filter=extra_filter)
         _resolve_covers(resp.get(key))
         return resp
     except Exception as e:
@@ -268,20 +288,74 @@ def _parse_limit(val):
 async def create_token_api(payload: dict):
     try:
         token_name = payload.get("name")
-        daily_limit = payload.get("daily_limit_gb")
-        monthly_limit = payload.get("monthly_limit_gb")
-
         if not token_name:
             raise HTTPException(status_code=400, detail="Token name is required")
 
         new_token = await db.add_api_token(
             token_name,
-            _parse_limit(daily_limit),
-            _parse_limit(monthly_limit)
+            _parse_limit(payload.get("daily_limit_gb")),
+            _parse_limit(payload.get("monthly_limit_gb")),
+            subscription_exempt=bool(payload.get("subscription_exempt")),
         )
         return new_token
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+#----- Toggle a token's lifetime (subscription-exempt) flag
+async def set_token_lifetime_api(token: str, payload: dict) -> dict:
+    exempt = bool(payload.get("subscription_exempt"))
+    if not await db.set_token_lifetime(token, exempt):
+        raise HTTPException(status_code=404, detail="Token not found.")
+    return {"status": "success", "subscription_exempt": exempt}
+
+
+#----- Set/extend/reduce a token's own expiry (subscription-off mode).
+#----- Optionally attach a Telegram user id at the same time.
+async def set_token_expiry_api(token: str, payload: dict) -> dict:
+    user_id = payload.get("user_id")
+    if user_id not in (None, "", 0, "0"):
+        try:
+            uid = int(user_id)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid Telegram user id.")
+        #----- Enforces one-user-one-token + pulls the real Telegram name
+        await link_token_user_api(token, uid)
+
+    action = str(payload.get("action") or "set")
+    days = int(payload.get("days") or 0)
+    result = await db.update_token_expiry(token, action, days)
+    if not result:
+        raise HTTPException(status_code=404, detail="Token not found.")
+    return {"status": "success", "expires_at": result.get("expires_at").isoformat() if result.get("expires_at") else None}
+
+
+#----- How many tokens would stop working if subscription mode is enabled
+async def subscription_preflight_api() -> dict:
+    return {"status": "success", "uncovered": await db.count_uncovered_tokens()}
+
+
+#----- Relabel "User <id>" placeholder subscribers with their real Telegram name
+async def backfill_subscriber_names_api() -> dict:
+    users = await db.get_all_subscribers()
+    updated = 0
+    for u in users:
+        uid = u.get("_id")
+        if uid is None or (u.get("first_name") or "") != f"User {uid}":
+            continue
+        name = await _fetch_tg_name(uid)
+        if name and name != f"User {uid}":
+            await db.update_subscriber_name(uid, name)
+            updated += 1
+    return {"status": "success", "updated": updated, "message": f"{updated} name(s) updated."}
+
+
+#----- Mark all tokens that aren't linked to a user as lifetime
+async def grant_lifetime_api() -> dict:
+    count = await db.grant_lifetime_to_unlinked()
+    return {"status": "success", "updated": count, "message": f"{count} token(s) marked as lifetime."}
 
 async def update_token_limits_api(token: str, payload: dict):
     try:
@@ -610,6 +684,8 @@ async def delete_subscription_plan_api(plan_id: str) -> dict:
 async def get_all_subscribers_api() -> dict:
     try:
         users = await db.get_all_subscribers()
+        for u in users:
+            u["is_admin"] = db._is_owner(u.get("_id"))
         return {"status": "success", "data": users}
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -618,14 +694,14 @@ async def manage_subscriber_api(user_id: int, payload: dict) -> dict:
     try:
         action = payload.get("action")
         days = int(payload.get("days", 0))
-        
-        if action not in ["extend", "reduce", "delete"]:
+
+        if action not in ["extend", "reduce", "delete", "remove"]:
             raise HTTPException(status_code=400, detail="Invalid action")
-            
+
         success = await db.manage_subscriber(user_id, action, days)
 
-        #----- On revoke, kick the user from the group immediately (ban+unban)
-        if success and action == "delete" and SettingsManager.current().subscription:
+        #----- On revoke/remove, kick the user from the group immediately (ban+unban)
+        if success and action in ("delete", "remove") and SettingsManager.current().subscription:
             group_id = SettingsManager.current().subscription_group_id
             if group_id:
                 try:
@@ -642,7 +718,7 @@ async def manage_subscriber_api(user_id: int, payload: dict) -> dict:
                 pass
 
         if success:
-            verb = {"extend": "extended", "reduce": "reduced", "delete": "revoked"}.get(action, "updated")
+            verb = {"extend": "extended", "reduce": "reduced", "delete": "revoked", "remove": "removed"}.get(action, "updated")
             return {"status": "success", "message": f"User subscription {verb} successfully"}
         else:
             raise HTTPException(status_code=404, detail="User not found or update failed")
@@ -669,56 +745,76 @@ async def get_all_tokens_api() -> dict:
             except Exception:
                 pass
 
-        #----- Non-empty display name for a user
+        #----- Display name, preferring a real name/alias over the "User <id>" placeholder
         def display_name(user, user_id, token_name=None):
+            placeholder = f"User {user_id}" if user_id is not None else None
+            options = [token_name]
             if user:
-                n = user.get("first_name") or user.get("username")
-                if n:
-                    return n
-            if token_name:
-                return token_name
-            return f"User {user_id}" if user_id else "Telegram User"
+                options += [user.get("first_name"), user.get("username")]
+            for o in options:
+                if o and o != placeholder:
+                    return o
+            for o in options:
+                if o:
+                    return o
+            return placeholder or "Telegram User"
+
+        sub_on = SettingsManager.current().subscription
 
         #----- Unified access entry from optional user + token records
         def build_entry(user_id, user, token_doc):
-            expiry = None
-            sub_status = None
+            token_doc = token_doc or {}
             user_found = bool(user)
+            sub_status = user.get("subscription_status") if user else None
+            is_admin = bool(token_doc.get("is_admin")) or db._is_owner(user_id)
+            lifetime = bool(token_doc.get("subscription_exempt"))
+            token_str = token_doc.get("token")
 
-            if user:
-                sub_status = user.get("subscription_status")
-                expiry = user.get("subscription_expiry")
+            token_expiry = token_doc.get("expires_at")
+            user_sub_expiry = user.get("subscription_expiry") if user else None
 
-            if token_doc:
-                t_expiry = token_doc.get("subscription_expiry") or token_doc.get("expires_at")
-                if t_expiry and not expiry:
-                    expiry = t_expiry
-
-            if SettingsManager.current().subscription:
-                if not user_found:
-                    is_expired = True
-                elif sub_status != "active":
-                    is_expired = True
-                elif not expiry:
-                    is_expired = True
-                else:
-                    is_expired = expiry < now
+            #----- Sub OFF: token's own expiry (display only). Sub ON: token expiry is an
+            #----- admin grant, otherwise fall back to the subscription's expiry.
+            if not sub_on:
+                expiry = token_expiry
+                is_expired = False
+            elif is_admin or lifetime:
+                expiry = None
+                is_expired = False
+            elif token_expiry is not None:
+                expiry = token_expiry
+                is_expired = token_expiry < now
+            elif user_found and sub_status == "active" and user_sub_expiry:
+                expiry = user_sub_expiry
+                is_expired = user_sub_expiry < now
             else:
-                is_expired = bool(expiry and expiry < now)
+                expiry = user_sub_expiry
+                is_expired = True
 
-            token_str = token_doc.get("token") if token_doc else None
-            created = token_doc.get("created_at") if token_doc else (user.get("created_at") if user else None)
+            created = token_doc.get("created_at") or (user.get("created_at") if user else None)
+            limits = token_doc.get("limits") or {}
+            usage = token_doc.get("usage") or {}
+            has_active_sub = sub_on and user_found and sub_status == "active" and bool(user_sub_expiry) and user_sub_expiry > now
+            never_expires = not expiry and (is_admin or lifetime or not sub_on)
 
             return {
                 "token": token_str,
                 "user_id": user_id,
-                "user_name": display_name(user, user_id, token_doc.get("name") if token_doc else None),
+                "user_name": display_name(user, user_id, token_doc.get("name")),
                 "user_found": user_found,
+                "is_admin": is_admin,
+                "lifetime": lifetime,
+                "never_expires": never_expires,
                 "has_token": bool(token_str),
+                "has_active_sub": has_active_sub,
                 "created_at": created.isoformat() if created else None,
                 "expires_at": expiry.isoformat() if expiry else None,
                 "is_expired": is_expired,
                 "sub_status": sub_status,
+                "daily_limit_gb": limits.get("daily_limit_gb") or 0,
+                "monthly_limit_gb": limits.get("monthly_limit_gb") or 0,
+                "daily_bytes": (usage.get("daily") or {}).get("bytes", 0),
+                "monthly_bytes": (usage.get("monthly") or {}).get("bytes", 0),
                 "addon_url": (
                     f"{SettingsManager.current().base_url}/stremio/{token_str}/manifest.json"
                     if token_str else None
@@ -752,7 +848,7 @@ async def get_all_tokens_api() -> dict:
 
         #----- Sort: active-with-token first, active-no-token next, expired last
         result.sort(key=lambda x: (x["is_expired"], not x["has_token"]))
-        return {"tokens": result}
+        return {"tokens": result, "subscription": sub_on}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -772,9 +868,13 @@ async def revoke_token_api(token: str) -> dict:
 #----- Assign or extend a subscription for any user_id
 async def assign_plan_api(user_id: int, days: int) -> dict:
     try:
-        if days < 1:
-            raise HTTPException(status_code=400, detail="Days must be at least 1.")
-        result = await db.assign_subscription(user_id, days)
+        #----- Use the real Telegram name so the Plans page shows it (not "User <id>")
+        name = await _fetch_tg_name(user_id)
+        #----- 0 / empty days means "never expires"
+        if days and days > 0:
+            result = await db.assign_subscription(user_id, days, name)
+        else:
+            result = await db.set_user_never_expires(user_id, name)
         return {"status": "success", "data": result}
     except HTTPException:
         raise
@@ -782,13 +882,37 @@ async def assign_plan_api(user_id: int, days: int) -> dict:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-#----- Link an orphan token to a Telegram user_id
+#----- Look up a Telegram user's display name via the bot (best-effort)
+async def _fetch_tg_name(user_id: int):
+    try:
+        u = await StreamBot.get_users(user_id)
+        if not u:
+            return None
+        name = (u.first_name or "").strip()
+        if getattr(u, "last_name", None):
+            name = f"{name} {u.last_name}".strip()
+        return name or (u.username or None)
+    except Exception:
+        return None
+
+
+#----- Link an orphan token to a Telegram user_id (one user_id = one token)
 async def link_token_user_api(token: str, user_id: int) -> dict:
     try:
-        success = await db.link_token_user(token, user_id)
+        existing = await db.get_api_token_by_user(user_id)
+        if existing and existing.get("token") == token:
+            return {"status": "success", "message": f"Already linked to user {user_id}."}
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail=f"User {user_id} is already linked to token '{existing.get('name')}'. Unlink or delete that token first.",
+            )
+        #----- Overwrite the token name with the user's real Telegram name when available
+        name = await _fetch_tg_name(user_id)
+        success = await db.link_token_user(token, user_id, name)
         if success:
-            return {"status": "success", "message": f"Token linked to user {user_id}."}
-        raise HTTPException(status_code=404, detail="Token not found or already linked.")
+            return {"status": "success", "message": f"Token linked to {name or user_id}."}
+        raise HTTPException(status_code=404, detail="Token not found.")
     except HTTPException:
         raise
     except Exception as e:
@@ -852,6 +976,25 @@ async def apply_media_rescan_api(request: Request, tmdb_id: int, db_index: int, 
 }
 
 
+#----- Manual add: fetch full metadata for a selected TMDB/IMDB title to autofill the form
+async def resolve_manual_metadata_api(media_type: str, selected_id: str) -> dict:
+    selected_id = str(selected_id or "").strip()
+    if not selected_id:
+        raise HTTPException(status_code=400, detail="selected_id is required.")
+    mt = _normalize_media_type(media_type)
+    data = await (
+        fetch_selected_movie_metadata(selected_id) if mt == "movie"
+        else fetch_selected_tv_metadata(selected_id)
+    )
+    if not data:
+        raise HTTPException(status_code=404, detail="Could not fetch metadata for the selected title.")
+    if data.get("poster"):
+        data["poster"] = resolve_cover_url(data["poster"])
+    if data.get("backdrop"):
+        data["backdrop"] = resolve_cover_url(data["backdrop"])
+    return {"metadata": data}
+
+
 #----- Manual add: resolve a Telegram post link into a streamable file
 async def resolve_telegram_api(payload: dict) -> dict:
     client = _scan_client()
@@ -869,6 +1012,95 @@ async def resolve_telegram_api(payload: dict) -> dict:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Could not read that message: {exc}")
     return {"status": "success", "data": data}
+
+
+async def resolve_subtitle_api(payload: dict) -> dict:
+    client = _scan_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="No Telegram client is connected yet.")
+    try:
+        data = await resolve_subtitle_message(
+            client, url=payload.get("url"),
+            chat_id=payload.get("chat_id"), msg_id=payload.get("msg_id"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read that message: {exc}")
+    return {"status": "success", "data": data}
+
+
+async def _resolve_imdb_id(media_type: str, tmdb_id, db_index) -> str:
+    if not (tmdb_id and db_index):
+        raise HTTPException(status_code=400, detail="tmdb_id and db_index are required.")
+    doc = await db.get_document(media_type, int(tmdb_id), int(db_index))
+    if not doc or not doc.get("imdb_id"):
+        raise HTTPException(status_code=404, detail="Title not found.")
+    return doc["imdb_id"]
+
+
+def list_subtitle_languages_api() -> dict:
+    return {"status": "success", "languages": list_languages()}
+
+
+async def list_subtitles_api(media_type: str, tmdb_id, db_index) -> dict:
+    mt = "tv" if media_type in ("tv", "series") else "movie"
+    imdb_id = await _resolve_imdb_id(mt, tmdb_id, db_index)
+    return {"status": "success", "subtitles": await list_title_subtitles(imdb_id)}
+
+
+async def add_subtitles_api(payload: dict) -> dict:
+    media_type = "tv" if payload.get("media_type") in ("tv", "series") else "movie"
+    imdb_id = await _resolve_imdb_id(media_type, payload.get("tmdb_id"), payload.get("db_index"))
+    items = payload.get("items") or []
+    if not isinstance(items, list) or not items:
+        raise HTTPException(status_code=400, detail="Provide at least one subtitle to add.")
+
+    client = _scan_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="No Telegram client is connected yet.")
+
+    added, errors = [], []
+    for item in items:
+        try:
+            season = item.get("season") if media_type == "tv" else None
+            episode = item.get("episode") if media_type == "tv" else None
+            if media_type == "tv" and (not season or not episode):
+                raise ValueError("Season and episode are required for series subtitles.")
+            resolved = await resolve_subtitle_message(
+                client, url=item.get("url"),
+                chat_id=item.get("chat_id"), msg_id=item.get("msg_id"),
+            )
+            doc = await manual_ingest_subtitle(
+                imdb_id, media_type, season, episode,
+                item.get("lang_code") or resolved["lang_code"],
+                resolved["chat_id"], resolved["msg_id"], resolved["name"],
+            )
+            added.append({
+                "name": doc["name"], "lang_label": doc["lang_label"],
+                "season": doc["season"], "episode": doc["episode"],
+            })
+        except ValueError as exc:
+            errors.append(str(exc))
+        except Exception as exc:
+            errors.append(f"Could not add subtitle: {exc}")
+
+    if not added and errors:
+        raise HTTPException(status_code=400, detail=" ".join(errors))
+    message = f"Added {len(added)} subtitle(s)."
+    if errors:
+        message += f" {len(errors)} failed: {' '.join(errors)}"
+    return {"status": "success", "message": message, "added": added, "errors": errors}
+
+
+async def remove_subtitle_api(payload: dict) -> dict:
+    chat_id = payload.get("chat_id")
+    msg_id = payload.get("msg_id")
+    if chat_id in (None, "") or msg_id in (None, ""):
+        raise HTTPException(status_code=400, detail="chat_id and msg_id are required.")
+    if not await remove_subtitle(chat_id, msg_id):
+        raise HTTPException(status_code=404, detail="Subtitle not found.")
+    return {"status": "success", "message": "Subtitle removed."}
 
 
 #----- Build a metadata base (title-level fields) from various sources
@@ -1039,10 +1271,41 @@ async def manual_add_media_api(payload: dict) -> dict:
         )
         if not updated_id:
             raise HTTPException(status_code=500, detail="Failed to add media (validation error).")
+        await stamp_caption_by_ref(client, p_channel, p_msg, metadata_info)
 
     result_tmdb_id = base["tmdb_id"]
     location = await db.find_media_doc(media_type, result_tmdb_id)
     result_db_index = location[1] if location else db.current_db_index
+
+    #----- Assign to selected custom catalogs before triggering auto sync, so any
+    #----- exclusivity is stamped on the doc first and auto sync correctly skips it.
+    #----- Guarded on `location` so we never add a reference to a non-existent doc.
+    catalog_ids = payload.get("catalog_ids") or []
+    catalogs_added = []
+    if location:
+        for cat_id in catalog_ids:
+            try:
+                cat_id = str(cat_id).strip()
+                if not cat_id:
+                    continue
+                added = await db.add_item_to_custom_catalog(cat_id, int(result_tmdb_id), int(result_db_index), media_type)
+                if added:
+                    catalog = await db.get_custom_catalog(cat_id)
+                    if catalog:
+                        catalogs_added.append(catalog.get("name", cat_id))
+                        cat_vis = catalog.get("visibility")
+                        if cat_vis in ("owner", "tokens"):
+                            await db.set_media_visibility(
+                                int(result_tmdb_id), int(result_db_index), media_type,
+                                cat_vis, catalog.get("allowed_tokens") or []
+                            )
+                        if catalog.get("exclusive"):
+                            await db.mark_item_exclusive(
+                                cat_id, int(result_tmdb_id), int(result_db_index),
+                                media_type, catalog.get("searchable", False)
+                            )
+            except Exception:
+                pass
 
     if result_tmdb_id and result_tmdb_id > 0:
         try:
@@ -1051,6 +1314,8 @@ async def manual_add_media_api(payload: dict) -> dict:
             pass
 
     message = f"Split stream added ({len(resolved_parts)} parts)." if is_split else "Stream added successfully."
+    if catalogs_added:
+        message += f" Added to: {', '.join(catalogs_added)}."
     return {
         "status": "success",
         "message": message,
@@ -1082,6 +1347,20 @@ async def list_custom_catalogs_api(
                     for item in catalog.get("items", []) or []
                 )
         return {"catalogs": catalogs}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def list_manual_add_catalogs_api():
+    try:
+        catalogs = await db.get_custom_catalogs()
+        filtered = [c for c in catalogs if not c.get("auto")]
+        filtered.sort(key=lambda c: (0 if c.get("exclusive") else 1, (c.get("name") or "").lower()))
+        return {"catalogs": [
+            {"_id": c["_id"], "name": c["name"], "exclusive": bool(c.get("exclusive")),
+             "visibility": c.get("visibility", "public")}
+            for c in filtered
+        ]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1322,7 +1601,7 @@ async def update_settings_api(payload: dict) -> dict:
         del payload["session_secret"]
 
     #----- Type coercion and validation
-    bool_keys = {"replace_mode", "hide_catalog", "subscription", "show_proxy_and_non_proxy_both", "announce_new_content"}
+    bool_keys = {"replace_mode", "duplicate_protection", "hide_catalog", "subscription", "show_proxy_and_non_proxy_both", "mediaflow_proxy", "announce_new_content", "delete_on_metadata_fail", "better_poster_enabled", "rpdb_enabled", "fanart_enabled", "fanart_shuffle", "fanart_low_res_poster"}
     for key in bool_keys:
         if key in payload:
             payload[key] = bool(payload[key])
@@ -1333,6 +1612,29 @@ async def update_settings_api(payload: dict) -> dict:
             if not isinstance(payload[key], list):
                 raise HTTPException(status_code=400, detail=f"'{key}' must be a list.")
             payload[key] = [str(v).strip() for v in payload[key] if str(v).strip()]
+
+    if "better_poster" in payload:
+        payload["better_poster"] = str(payload["better_poster"] or "").strip()
+        if payload["better_poster"] and "{imdb_id}" not in payload["better_poster"]:
+            raise HTTPException(status_code=400, detail="wrong betterposter url")
+
+    if "rpdb_api_key" in payload:
+        payload["rpdb_api_key"] = str(payload["rpdb_api_key"] or "").strip()
+
+    if "fanart_api_key" in payload:
+        payload["fanart_api_key"] = str(payload["fanart_api_key"] or "").strip()
+
+    if "fanart_shuffle_interval" in payload:
+        try:
+            payload["fanart_shuffle_interval"] = max(0, int(payload["fanart_shuffle_interval"]))
+        except (ValueError, TypeError):
+            payload["fanart_shuffle_interval"] = 5
+
+    if len([k for k in ("better_poster_enabled", "rpdb_enabled", "fanart_enabled") if payload.get(k)]) > 1:
+        raise HTTPException(status_code=400, detail="Enable only one poster provider at a time")
+
+    if payload.get("fanart_enabled") and not str(payload.get("fanart_api_key") or "").strip():
+        raise HTTPException(status_code=400, detail="Fanart.tv API key is required")
 
     if "extra_databases" in payload:
         for uri in payload["extra_databases"]:
@@ -1400,10 +1702,47 @@ async def update_settings_api(payload: dict) -> dict:
             cleaned.append(channel)
         payload["manual_channels"] = cleaned
 
+    #----- The same channel id may not appear in more than one channel field.
+    #----- Only AUTH ∩ ANIME is allowed, because an anime channel is an auth channel
+    #----- that's flagged as anime (the receiver only indexes files from auth channels).
+    _channel_fields = ("auth_channels", "manual_channels", "global_search_channels",
+                       "anime_channels", "announcement_channel", "skip_channel")
+    if any(field in payload for field in _channel_fields):
+        current = SettingsManager.current()
+
+        def _norm_ids(values) -> set:
+            if isinstance(values, str):
+                values = [values]
+            return {str(c).strip().replace("-100", "") for c in (values or []) if str(c).strip()}
+
+        groups = {
+            "AUTH": _norm_ids(payload.get("auth_channels", list(current.auth_channels))),
+            "MANUAL": _norm_ids(payload.get("manual_channels", list(current.manual_channels))),
+            "GLOBAL SEARCH": _norm_ids(payload.get("global_search_channels", list(current.global_search_channels))),
+            "ANIME": _norm_ids(payload.get("anime_channels", list(current.anime_channels))),
+            "ANNOUNCEMENT": _norm_ids(payload.get("announcement_channel", current.announcement_channel)),
+            "SKIP": _norm_ids(payload.get("skip_channel", current.skip_channel)),
+        }
+
+        allowed_overlap = frozenset({"AUTH", "ANIME"})
+        names = list(groups)
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                a, b = names[i], names[j]
+                if frozenset({a, b}) == allowed_overlap:
+                    continue
+                clash = groups[a] & groups[b]
+                if clash:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Channel {', '.join(sorted(clash))} can't be in both {a} and {b} channels — each channel may only belong to one field."
+                    )
+
     #----- Strip whitespace from string fields
     for key in ("tmdb_api", "base_url", "upstream_repo", "upstream_branch",
                 "admin_username", "admin_password", "session_secret", "http_proxy_url",
-                "payment_instructions", "payment_qr_url", "announcement_channel"):
+                "mediaflow_password", "payment_instructions", "payment_qr_url",
+                "announcement_channel", "skip_channel"):
         if key in payload and isinstance(payload[key], str):
             payload[key] = payload[key].strip()
 
@@ -1452,6 +1791,253 @@ async def get_tools_channels_api() -> dict:
     return {"status": "success", "data": result}
 
 
+#----- ── Manual upload session (web replacement for the /set bot command) ──
+
+#----- Personal (hand-made) titles get a negative synthetic tmdb_id; real ones are positive
+def _is_personal_media(tmdb_id) -> bool:
+    try:
+        return int(tmdb_id) < 0
+    except (TypeError, ValueError):
+        return False
+
+
+#----- Normalize a media document into a compact session-picker result
+def _session_result(doc: dict) -> dict:
+    mt = doc.get("media_type") or doc.get("type") or "movie"
+    mt = "tv" if str(mt).lower() in ("tv", "series") else "movie"
+    imdb_id = doc.get("imdb_id") or ""
+    tmdb_id = doc.get("tmdb_id")
+    selected_id = imdb_id if str(imdb_id).startswith("tt") else (str(tmdb_id) if tmdb_id is not None else "")
+    return {
+        "tmdb_id": tmdb_id,
+        "db_index": doc.get("db_index"),
+        "media_type": mt,
+        "title": doc.get("title") or "",
+        "year": doc.get("release_year") or "",
+        "poster": resolve_cover_url(doc.get("poster") or ""),
+        "imdb_id": imdb_id,
+        "selected_id": selected_id,
+        "is_personal": _is_personal_media(tmdb_id),
+        "in_library": True,
+    }
+
+
+#----- Search the library, then IMDb/Cinemeta + TMDB, by title or an id/link
+async def search_manual_session_api(query: str) -> dict:
+    query = (query or "").strip()
+    if not query:
+        return {"results": []}
+
+    results: list[dict] = []
+    seen: set = set()
+
+    def _add(doc: dict) -> None:
+        entry = _session_result(doc)
+        key = (entry["tmdb_id"], entry["db_index"], entry["media_type"])
+        if entry["tmdb_id"] is None or key in seen:
+            return
+        seen.add(key)
+        results.append(entry)
+
+    default_id = extract_default_id(query)
+    if default_id:
+        try:
+            if str(default_id).startswith("tt"):
+                doc = await db.get_media_details(default_id)
+                if doc:
+                    _add(doc)
+            else:
+                for mt in ("movie", "tv"):
+                    location = await db.find_media_doc(mt, int(default_id))
+                    if location:
+                        found, db_index = location
+                        found["media_type"] = mt
+                        found["db_index"] = db_index
+                        _add(found)
+        except Exception as e:
+            LOGGER.warning(f"[Manual Session] id lookup failed for '{query}': {e}")
+
+    if not default_id:
+        try:
+            data = await db.search_documents(query, 1, 20)
+            for doc in data.get("results", []):
+                _add(doc)
+        except Exception as e:
+            LOGGER.warning(f"[Manual Session] library search failed for '{query}': {e}")
+
+    library_ids = {(e.get("imdb_id") or "", str(e.get("tmdb_id") or "")) for e in results}
+    try:
+        online = await search_any_candidates(query)
+    except Exception as e:
+        LOGGER.warning(f"[Manual Session] online search failed for '{query}': {e}")
+        online = []
+
+    for cand in online:
+        if not cand.get("selected_id") or not cand.get("title"):
+            continue
+        imdb_id = cand.get("imdb_id") or ""
+        tmdb_id = cand.get("tmdb_id")
+        if (imdb_id, str(tmdb_id or "")) in library_ids:
+            continue
+        results.append({
+            "tmdb_id": tmdb_id,
+            "db_index": None,
+            "media_type": "tv" if cand.get("media_type") == "tv" else "movie",
+            "title": cand.get("title") or "",
+            "year": cand.get("year") or "",
+            "poster": resolve_cover_url(cand.get("poster") or ""),
+            "imdb_id": imdb_id,
+            "selected_id": str(cand.get("selected_id")),
+            "source": cand.get("source"),
+            "is_personal": False,
+            "in_library": False,
+        })
+
+    return {"results": results}
+
+
+#----- Current active manual upload session (or None)
+async def get_manual_session_api() -> dict:
+    return {"session": getattr(Backend, "MANUAL_SESSION", None)}
+
+
+async def _set_online_manual_session(payload: dict, media_type: str, selected_id: str) -> dict:
+    if not selected_id:
+        raise HTTPException(status_code=400, detail="A library title or a selected id is required.")
+
+    meta = await (
+        fetch_selected_movie_metadata(selected_id) if media_type == "movie"
+        else fetch_selected_tv_metadata(selected_id)
+    )
+    if not meta:
+        raise HTTPException(status_code=404, detail="Could not fetch metadata for the selected title.")
+
+    imdb_id = meta.get("imdb_id") or ""
+    default_id = imdb_id if str(imdb_id).startswith("tt") else selected_id
+
+    season = payload.get("season")
+    if media_type == "tv" and season is not None and str(season).strip() != "":
+        try:
+            season = int(season)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Season must be a number.")
+    else:
+        season = None
+
+    try:
+        display_tmdb = int(meta.get("tmdb_id")) if meta.get("tmdb_id") is not None else 0
+    except (TypeError, ValueError):
+        display_tmdb = 0
+
+    session = {
+        "tmdb_id": display_tmdb,
+        "db_index": None,
+        "media_type": media_type,
+        "title": meta.get("title") or "",
+        "year": meta.get("release_year") or "",
+        "is_personal": False,
+        "kind": "real",
+        "default_id": default_id,
+        "season": season,
+        "episode": None,
+        "quality": None,
+    }
+    Backend.MANUAL_SESSION = session
+    return {"status": "success", "session": session}
+
+
+#----- Activate a manual upload session targeting an existing library title.
+#----- Real (TMDB/IMDb) titles parse season/episode/quality from each file; personal
+#----- (hand-made) titles need a season for TV since their files carry no metadata.
+async def set_manual_session_api(payload: dict) -> dict:
+    tmdb_id = payload.get("tmdb_id")
+    db_index = payload.get("db_index")
+    media_type = _normalize_media_type(payload.get("media_type", "movie"))
+    selected_id = str(payload.get("selected_id") or "").strip()
+    in_library = payload.get("in_library", True) and tmdb_id is not None and db_index is not None
+
+    if not in_library:
+        return await _set_online_manual_session(payload, media_type, selected_id)
+
+    doc = await db.get_document(media_type, int(tmdb_id), int(db_index))
+    if not doc:
+        raise HTTPException(status_code=404, detail="That title was not found in your library.")
+
+    is_personal = _is_personal_media(tmdb_id)
+    session = {
+        "tmdb_id": int(tmdb_id),
+        "db_index": int(db_index),
+        "media_type": media_type,
+        "title": doc.get("title") or "",
+        "year": doc.get("release_year") or "",
+        "is_personal": is_personal,
+    }
+
+    if is_personal:
+        #----- Personal: files have no usable metadata, so season/episode come from here
+        season = payload.get("season")
+        episode = payload.get("episode")
+        quality = str(payload.get("quality") or "").strip()
+
+        if media_type == "tv":
+            if season is None or str(season).strip() == "":
+                raise HTTPException(status_code=400, detail="A season number is required for personal TV shows.")
+            try:
+                season = int(season)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Season must be a number.")
+            if episode is not None and str(episode).strip() != "":
+                try:
+                    episode = int(episode)
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=400, detail="Episode must be a number.")
+            else:
+                episode = None
+        else:
+            season = None
+            episode = None
+
+        session.update({
+            "kind": "personal",
+            "default_id": None,
+            "season": season,
+            "episode": episode,
+            "quality": quality or None,
+        })
+    else:
+        #----- Real: force the title's own id and let metadata() parse from each file.
+        #----- An optional season is only used as a fallback for files that carry an
+        #----- episode but no season (e.g. absolute-numbered anime).
+        imdb_id = doc.get("imdb_id") or ""
+        default_id = imdb_id if str(imdb_id).startswith("tt") else str(int(tmdb_id))
+
+        season = payload.get("season")
+        if media_type == "tv" and season is not None and str(season).strip() != "":
+            try:
+                season = int(season)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Season must be a number.")
+        else:
+            season = None
+
+        session.update({
+            "kind": "real",
+            "default_id": default_id,
+            "season": season,
+            "episode": None,
+            "quality": None,
+        })
+
+    Backend.MANUAL_SESSION = session
+    return {"status": "success", "session": session}
+
+
+#----- Clear the active manual upload session
+async def clear_manual_session_api() -> dict:
+    Backend.MANUAL_SESSION = None
+    return {"status": "success"}
+
+
 #----- Start a scan or rescan job over the given channels
 async def start_scan_api(payload: dict) -> dict:
     client = _scan_client()
@@ -1497,6 +2083,34 @@ async def cancel_dbcheck_api() -> dict:
 
 async def dbcheck_status_api() -> dict:
     return {"status": "success", "data": dbcheck_manager.get_status()}
+
+
+#----- ── Duplicate check & cleanup ──
+async def start_duplicate_check_api() -> dict:
+    result = await duplicate_manager.start()
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result.get("message", "Could not start duplicate scan."))
+    return {"status": "success", **result}
+
+
+async def cancel_duplicate_check_api() -> dict:
+    result = await duplicate_manager.cancel()
+    return {"status": "success" if result.get("ok") else "error", **result}
+
+
+async def duplicate_check_status_api() -> dict:
+    return {"status": "success", "data": duplicate_manager.get_status()}
+
+
+#----- Remove selected duplicate streams, or (delete_all) keep the newest per group
+async def purge_duplicates_api(payload: dict | None = None) -> dict:
+    payload = payload or {}
+    delete_all = bool(payload.get("delete_all"))
+    stream_ids = payload.get("stream_ids")
+    if not delete_all and (not isinstance(stream_ids, list) or not stream_ids):
+        raise HTTPException(status_code=400, detail="Provide 'stream_ids' or set 'delete_all'.")
+    result = await duplicate_manager.purge(stream_ids, delete_all=delete_all)
+    return {"status": "success" if result.get("ok") else "error", **result}
 
 
 #----- Purge dead links (from last dbcheck, flagged in DB, or a specific set)
@@ -1664,3 +2278,363 @@ async def _perform_restart(delay: float = 1.0) -> None:
 async def restart_app_api() -> dict:
     asyncio.create_task(_perform_restart())
     return {"status": "success", "message": "Restart initiated — the server will be back shortly."}
+
+
+
+_bot_admin_apply_state: dict = {
+    "running": False,
+    "status": "idle",
+    "total": 0,
+    "done": 0,
+    "results": [],
+    "error": "",
+    "task": None,
+}
+
+
+def _norm_chat_id(ch):
+    s = str(ch).strip()
+    if not s:
+        return None
+    return int(s) if s.lstrip("-").isdigit() else s
+
+
+async def _managed_bots() -> list[dict]:
+    bots: list[dict] = []
+    for cid in sorted(multi_clients.keys()):
+        client = multi_clients.get(cid)
+        if client is None:
+            continue
+        me = getattr(client, "me", None)
+        if me is None:
+            try:
+                me = await client.get_me()
+            except Exception as e:
+                LOGGER.warning(f"[BotAdmin] Could not resolve bot client {cid}: {e}")
+                me = None
+        if not me:
+            continue
+        bots.append({
+            "client_id": cid,
+            "user_id": me.id,
+            "username": me.username,
+            "name": me.first_name or me.username or f"Bot {cid + 1}",
+            "is_main": cid == 0,
+        })
+    return bots
+
+
+def _bot_served_channels() -> list[dict]:
+    s = SettingsManager.current()
+    order: list[str] = []
+    mapping: dict[str, dict] = {}
+
+    def add(ch, role):
+        nid = _norm_chat_id(ch)
+        if nid is None:
+            return
+        key = str(nid)
+        if key not in mapping:
+            mapping[key] = {"id": nid, "roles": []}
+            order.append(key)
+        if role not in mapping[key]["roles"]:
+            mapping[key]["roles"].append(role)
+
+    for ch in s.auth_channels:
+        add(ch, "auth")
+    for ch in s.manual_channels:
+        add(ch, "manual")
+    for ch in s.anime_channels:
+        add(ch, "anime")
+    if s.announcement_channel:
+        add(s.announcement_channel, "announce")
+    if s.skip_channel:
+        add(s.skip_channel, "skip")
+    return [mapping[k] for k in order]
+
+
+def _bot_admin_privileges() -> ChatPrivileges:
+    return ChatPrivileges(
+        can_manage_chat=True,
+        can_post_messages=True,
+        can_edit_messages=True,
+        can_delete_messages=True,
+        can_invite_users=True,
+        can_pin_messages=False,
+        can_promote_members=False,
+        can_change_info=False,
+        can_restrict_members=False,
+        can_manage_video_chats=False,
+        is_anonymous=False,
+    )
+
+
+def _no_privileges() -> ChatPrivileges:
+    return ChatPrivileges(
+        can_manage_chat=False,
+        can_post_messages=False,
+        can_edit_messages=False,
+        can_delete_messages=False,
+        can_invite_users=False,
+        can_pin_messages=False,
+        can_promote_members=False,
+        can_change_info=False,
+        can_restrict_members=False,
+        can_manage_video_chats=False,
+        is_anonymous=False,
+    )
+
+
+async def _bot_member_status(chat_id, bot_user_id) -> str:
+    try:
+        m = await Userbot.get_chat_member(chat_id, bot_user_id)
+        st = m.status
+        if st in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR):
+            return "admin"
+        if st == ChatMemberStatus.BANNED:
+            return "banned"
+        if st == ChatMemberStatus.RESTRICTED:
+            return "restricted"
+        if st == ChatMemberStatus.MEMBER:
+            return "member"
+        return "missing"
+    except Exception:
+        return "missing"
+
+
+def _friendly_promote_error(exc) -> str:
+    msg = str(exc)
+    up = msg.upper()
+    if "CHAT_ADMIN_REQUIRED" in up:
+        return "Your session account isn't an admin with rights to do this here."
+    if "USER_CREATOR" in up or "ADMIN_RANK" in up:
+        return "Can't modify the channel creator."
+    if "ADD_ADMINS" in up or ("PROMOTE" in up and "RIGHT" in up):
+        return "Your session account can't grant these rights (it doesn't hold them itself)."
+    if "PARTICIPANT" in up or "USER_NOT_MUTUAL_CONTACT" in up:
+        return "The bot isn't in the channel and couldn't be added automatically."
+    if "BOTS_TOO_MUCH" in up:
+        return "This channel already has the maximum number of bots."
+    return msg
+
+
+async def _session_rights(chat_id) -> dict:
+    try:
+        me = await Userbot.get_chat_member(chat_id, "me")
+    except Exception as e:
+        return {"manageable": False, "status": "unknown", "reason": f"Couldn't check your rights: {e}"}
+    st = me.status
+    if st == ChatMemberStatus.OWNER:
+        return {"manageable": True, "status": "owner", "reason": ""}
+    if st == ChatMemberStatus.ADMINISTRATOR:
+        can_promote = bool(getattr(me, "privileges", None) and me.privileges.can_promote_members)
+        return {
+            "manageable": can_promote,
+            "status": "admin_can_promote" if can_promote else "admin_no_promote",
+            "reason": "" if can_promote else "You're an admin here but without the 'Add New Admins' permission.",
+        }
+    return {"manageable": False, "status": "not_admin", "reason": "Your session account is not an admin here."}
+
+
+async def bot_admin_scan_api() -> dict:
+    if Userbot is None:
+        return {"status": "error", "reason": "no_session",
+                "message": "Add a session string (USER_SESSION_STRING) to manage channel admins."}
+
+    bots = await _managed_bots()
+    if len(bots) <= 1:
+        return {"status": "error", "reason": "single_token", "bots": bots,
+                "message": "Add at least one extra bot token (multi-token) to use this tool."}
+
+    channels = _bot_served_channels()
+    managed_ids = {b["user_id"] for b in bots}
+    out: list[dict] = []
+
+    for ch in channels:
+        cid = ch["id"]
+        entry = {
+            "id": str(cid), "roles": ch["roles"], "name": str(cid),
+            "accessible": False, "manageable": False, "session_status": "",
+            "reason": "", "bots": {}, "orphans": [],
+        }
+
+        try:
+            chat = await Userbot.get_chat(cid)
+            entry["name"] = getattr(chat, "title", None) or getattr(chat, "first_name", None) or str(cid)
+            entry["accessible"] = True
+        except Exception as e:
+            entry["reason"] = f"Session account can't access this channel: {e}"
+            out.append(entry)
+            continue
+
+        rights = await _session_rights(cid)
+        entry["manageable"] = rights["manageable"]
+        entry["session_status"] = rights["status"]
+        entry["reason"] = rights["reason"]
+
+        for b in bots:
+            entry["bots"][str(b["user_id"])] = await _bot_member_status(cid, b["user_id"])
+
+        try:
+            async for m in Userbot.get_chat_members(cid, filter=ChatMembersFilter.ADMINISTRATORS):
+                u = getattr(m, "user", None)
+                if u and getattr(u, "is_bot", False) and u.id not in managed_ids:
+                    entry["orphans"].append({
+                        "user_id": u.id, "username": u.username,
+                        "name": u.first_name or u.username or str(u.id),
+                    })
+        except Exception as e:
+            LOGGER.warning(f"[BotAdmin] Could not list admins for {cid}: {e}")
+
+        out.append(entry)
+
+    return {"status": "success", "data": {"bots": bots, "channels": out}}
+
+
+async def _promote_one(chat_id, bot: dict, privileges: ChatPrivileges, _retry: bool = True) -> dict:
+    label = bot.get("name") or (f"@{bot['username']}" if bot.get("username") else str(bot["user_id"]))
+    bid = bot["user_id"]
+
+    if await _bot_member_status(chat_id, bid) == "admin":
+        return {"bot": label, "user_id": bid, "status": "already", "message": "Already an admin."}
+
+    try:
+        await Userbot.promote_chat_member(chat_id, bid, privileges=privileges)
+        return {"bot": label, "user_id": bid, "status": "added", "message": "Promoted to admin."}
+    except FloodWait as fw:
+        wait = int(getattr(fw, "value", getattr(fw, "x", 5)) or 5)
+        if _retry:
+            await asyncio.sleep(wait + 1)
+            return await _promote_one(chat_id, bot, privileges, _retry=False)
+        return {"bot": label, "user_id": bid, "status": "error",
+                "message": f"Rate-limited by Telegram (wait {wait}s) — try again."}
+    except Exception as e:
+        up = str(e).upper()
+        if _retry and ("PARTICIPANT" in up or "USER_NOT_MUTUAL_CONTACT" in up):
+            try:
+                await Userbot.add_chat_members(chat_id, bid)
+                await asyncio.sleep(0.5)
+                await Userbot.promote_chat_member(chat_id, bid, privileges=privileges)
+                return {"bot": label, "user_id": bid, "status": "added", "message": "Added and promoted to admin."}
+            except Exception as e2:
+                return {"bot": label, "user_id": bid, "status": "error", "message": _friendly_promote_error(e2)}
+        return {"bot": label, "user_id": bid, "status": "error", "message": _friendly_promote_error(e)}
+
+
+async def _demote_one(chat_id, user) -> dict:
+    label = getattr(user, "first_name", None) or (f"@{user.username}" if getattr(user, "username", None) else str(user.id))
+    try:
+        await Userbot.promote_chat_member(chat_id, user.id, privileges=_no_privileges())
+        return {"bot": label, "user_id": user.id, "status": "demoted", "message": "Admin rights removed (orphan)."}
+    except Exception as e:
+        return {"bot": label, "user_id": user.id, "status": "error", "message": _friendly_promote_error(e)}
+
+
+async def _run_bot_admin_apply(channel_ids, selected, demote_orphans, managed_ids) -> None:
+    state = _bot_admin_apply_state
+    privileges = _bot_admin_privileges()
+    try:
+        for raw in channel_ids:
+            cid = _norm_chat_id(raw)
+            ch_result = {"id": str(cid), "name": str(cid), "items": []}
+
+            try:
+                chat = await Userbot.get_chat(cid)
+                ch_result["name"] = getattr(chat, "title", None) or getattr(chat, "first_name", None) or str(cid)
+            except Exception as e:
+                ch_result["items"].append({"bot": "—", "status": "error", "message": f"Channel not accessible: {e}"})
+                state["results"].append(ch_result)
+                state["done"] += 1
+                continue
+
+            rights = await _session_rights(cid)
+            if not rights["manageable"]:
+                ch_result["items"].append({
+                    "bot": "—", "status": "skipped",
+                    "message": rights["reason"] or "Your session account can't add admins here.",
+                })
+                state["results"].append(ch_result)
+                state["done"] += 1
+                continue
+
+            for b in selected:
+                ch_result["items"].append(await _promote_one(cid, b, privileges))
+                await asyncio.sleep(0.3)
+
+            if demote_orphans:
+                try:
+                    async for m in Userbot.get_chat_members(cid, filter=ChatMembersFilter.ADMINISTRATORS):
+                        u = getattr(m, "user", None)
+                        if u and getattr(u, "is_bot", False) and u.id not in managed_ids:
+                            ch_result["items"].append(await _demote_one(cid, u))
+                            await asyncio.sleep(0.3)
+                except Exception as e:
+                    ch_result["items"].append({"bot": "orphans", "status": "error", "message": f"Couldn't scan orphans: {e}"})
+
+            state["results"].append(ch_result)
+            state["done"] += 1
+
+        state["status"] = "completed"
+    except Exception as e:
+        LOGGER.error(f"[BotAdmin] Apply run failed: {e}")
+        state["status"] = "error"
+        state["error"] = str(e)
+    finally:
+        state["running"] = False
+
+
+async def bot_admin_apply_api(payload: dict | None = None) -> dict:
+    if Userbot is None:
+        raise HTTPException(status_code=503, detail="No session string configured.")
+
+    if _bot_admin_apply_state["running"]:
+        raise HTTPException(status_code=409, detail="An apply run is already in progress.")
+
+    payload = payload or {}
+    channel_ids = payload.get("channel_ids") or []
+    if not isinstance(channel_ids, list) or not channel_ids:
+        raise HTTPException(status_code=400, detail="Select at least one channel.")
+
+    bots = await _managed_bots()
+    if len(bots) <= 1:
+        raise HTTPException(status_code=400, detail="Need a session string and more than one bot token.")
+
+    bot_by_id = {str(b["user_id"]): b for b in bots}
+    sel_ids = payload.get("bot_ids")
+    if isinstance(sel_ids, list) and sel_ids:
+        selected = [bot_by_id[str(x)] for x in sel_ids if str(x) in bot_by_id]
+    else:
+        selected = bots
+    if not selected:
+        raise HTTPException(status_code=400, detail="No matching bots selected.")
+
+    demote_orphans = bool(payload.get("demote_orphans"))
+    managed_ids = {b["user_id"] for b in bots}
+
+    _bot_admin_apply_state.update({
+        "running": True,
+        "status": "running",
+        "total": len(channel_ids),
+        "done": 0,
+        "results": [],
+        "error": "",
+    })
+    _bot_admin_apply_state["task"] = asyncio.create_task(
+        _run_bot_admin_apply(channel_ids, selected, demote_orphans, managed_ids)
+    )
+    return {"status": "started", "total": len(channel_ids)}
+
+
+async def bot_admin_apply_status_api() -> dict:
+    st = _bot_admin_apply_state
+    return {
+        "status": "success",
+        "data": {
+            "running": st["running"],
+            "state": st["status"],
+            "total": st["total"],
+            "done": st["done"],
+            "results": st["results"],
+            "error": st["error"],
+        },
+    }

@@ -10,11 +10,10 @@ from Backend import __version__, db
 from Backend.fastapi import server
 from Backend.fastapi.main import app
 from Backend.helper import subscription_task_manager
-from Backend.helper.auto_catalog import start_auto_catalog_sync_background
 from Backend.helper.link_checker import DeadLinkChecker
 from Backend.helper.pinger import ping
 from Backend.helper.pyro import restart_notification, setup_bot_commands
-from Backend.helper.scan_manager import dbcheck_manager, scan_manager
+from Backend.helper.scan_manager import dbcheck_manager, duplicate_manager, scan_manager
 from Backend.helper.settings_manager import SettingsManager
 from Backend.logger import LOGGER
 from Backend.pyrofork.bot import StreamBot, Userbot
@@ -38,6 +37,7 @@ async def start_services():
 
         await scan_manager.load(db)
         dbcheck_manager.bind_db(db)
+        duplicate_manager.bind_db(db)
         await asyncio.sleep(0.3)
 
         await db.reload_extra_databases(SettingsManager.current().extra_databases)
@@ -70,7 +70,6 @@ async def start_services():
 
         link_checker_task = DeadLinkChecker(db, app, check_interval_hours=24)
         loop.create_task(link_checker_task.start())
-        loop.create_task(start_auto_catalog_sync_background(db, delay_seconds=20))
 
         await subscription_task_manager.sync(StreamBot)
 

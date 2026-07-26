@@ -1,9 +1,11 @@
 import re
 from typing import Optional, Tuple
 
-from Backend.helper.metadata import parse_media_name
+from Backend.helper.metadata import caption_with_id, parse_media_name
 from Backend.helper.pyro import clean_filename, finalize_media_name, get_readable_file_size, is_media
 from Backend.helper.split_files import parse_split_info, strip_part_suffix
+from Backend.logger import LOGGER
+from Backend.helper.task_manager import edit_message
 
 _PRIVATE_LINK = re.compile(r"t\.me/c/(\d+)(?:/\d+)*/(\d+)")
 _PUBLIC_LINK = re.compile(r"t\.me/([A-Za-z][\w]{3,})/(?:\d+/)?(\d+)")
@@ -122,4 +124,34 @@ async def resolve_telegram_message(client, url: str = None, chat_id=None, msg_id
         "height": height,
         "has_thumb": bool(getattr(media, "thumbs", None)),
         "upload_year": upload_year,
+        "split_key": split_info[0] if split_info else None,
+        "part_number": split_info[1] if split_info else None,
     }
+
+
+
+async def stamp_caption_with_id(message, metadata_info: dict) -> bool:
+    try:
+        media = message.video or message.document
+        base = (getattr(message, "caption", None) or getattr(media, "file_name", None) or "")
+        new_caption = caption_with_id(base, metadata_info)
+        if not new_caption:
+            return False
+        
+        await edit_message(message.chat.id, message.id, new_caption)
+        return True
+    except Exception as e:
+        LOGGER.warning(f"[Caption] Could not stamp id on message {getattr(message, 'id', '?')}: {e}")
+        return False
+
+
+async def stamp_caption_by_ref(client, chat_id, msg_id, metadata_info: dict) -> bool:
+    try:
+        chat_ref = int(f"-100{str(chat_id).replace('-100', '')}")
+        message = await client.get_messages(chat_ref, int(msg_id))
+        if not message or getattr(message, "empty", False):
+            return False
+        return await stamp_caption_with_id(message, metadata_info)
+    except Exception as e:
+        LOGGER.warning(f"[Caption] Could not stamp id on message {msg_id}: {e}")
+        return False

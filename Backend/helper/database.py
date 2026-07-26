@@ -81,12 +81,32 @@ class Database:
                 await tracking["custom_catalogs"].create_index(
                     [("items.tmdb_id", ASCENDING), ("items.media_type", ASCENDING)]
                 )
+                await self._ensure_subtitle_indexes(tracking)
             except Exception as e:
                 LOGGER.error(f"Failed creating tracking indexes: {e}")
 
         for db_key in list(self.dbs.keys()):
             if db_key.startswith("storage_"):
                 await self._ensure_storage_indexes(db_key)
+
+    async def _ensure_subtitle_indexes(self, tracking) -> None:
+        subs = tracking["subtitles"]
+        try:
+            info = await subs.index_information()
+        except Exception:
+            info = {}
+        for name, spec in info.items():
+            if name == "_id_":
+                continue
+            keys = [k for k, _ in spec.get("key", [])]
+            if keys == ["stream_id"] or (spec.get("unique") and "stream_id" in keys):
+                try:
+                    await subs.drop_index(name)
+                    LOGGER.info(f"Dropped stale subtitle index {name}")
+                except Exception as e:
+                    LOGGER.error(f"Failed dropping subtitle index {name}: {e}")
+        await subs.create_index([("chat_id", ASCENDING), ("msg_id", ASCENDING)], unique=True)
+        await subs.create_index([("imdb_id", ASCENDING), ("season", ASCENDING), ("episode", ASCENDING)])
 
     #----- Ensure per-storage-DB indexes on the movie/tv collections.
     #----- tmdb_id + imdb_id drive catalog hydration and stream lookups.
@@ -404,6 +424,9 @@ class Database:
                 },
                 upsert=True
             )
+            if status == "active":
+                await self.ensure_api_token_for_user(user_id, (user or {}).get("first_name"))
+            await self.align_token_with_subscription(user_id)
             return True
 
         elif action == "delete":
@@ -411,11 +434,22 @@ class Database:
                 {"_id": user_id},
                 {"$set": {"subscription_status": "expired", "subscription_expiry": now}}
             )
+            await self.align_token_with_subscription(user_id)
+            return True
+
+        elif action == "remove":
+            await self.align_token_with_subscription(user_id)
+            await self.dbs["tracking"]["users"].delete_one({"_id": user_id})
             return True
 
         return False
 
-    async def assign_subscription(self, user_id: int, days: int) -> dict:
+    #----- Update a subscriber's display name (and the linked token's name)
+    async def update_subscriber_name(self, user_id: int, name: str) -> None:
+        await self.dbs["tracking"]["users"].update_one({"_id": user_id}, {"$set": {"first_name": name}})
+        await self.dbs["tracking"]["api_tokens"].update_one({"user_id": user_id}, {"$set": {"name": name}})
+
+    async def assign_subscription(self, user_id: int, days: int, name: str = None) -> dict:
         #----- Upsert a subscription for any user_id, creating a record if it doesn't exist
         now = datetime.utcnow()
 
@@ -429,27 +463,58 @@ class Database:
         else:
             new_expiry = now + timedelta(days=days)
 
+        set_fields = {"subscription_expiry": new_expiry, "subscription_status": "active"}
+        insert_fields = {"_id": user_id, "username": None, "created_at": now}
+        if name:
+            set_fields["first_name"] = name
+        else:
+            insert_fields["first_name"] = f"User {user_id}"
+
         await self.dbs["tracking"]["users"].update_one(
             {"_id": user_id},
-            {
-                "$set": {
-                    "subscription_expiry": new_expiry,
-                    "subscription_status": "active",
-                },
-                "$setOnInsert": {
-                    "_id": user_id,
-                    "first_name": f"User {user_id}",
-                    "username": None,
-                    "created_at": now,
-                }
-            },
+            {"$set": set_fields, "$setOnInsert": insert_fields},
             upsert=True
         )
+        token_doc = await self.ensure_api_token_for_user(user_id, (user or {}).get("first_name"))
+        token = token_doc.get("token") if token_doc else None
+        await self.align_token_with_subscription(user_id)
         return {
             "user_id": user_id,
             "subscription_expiry": new_expiry.isoformat(),
             "subscription_status": "active",
             "days_assigned": days,
+            "token": token,
+            "addon_url": (
+                f"{SettingsManager.current().base_url}/stremio/{token}/manifest.json" if token else None
+            ),
+        }
+
+    #----- Give a user's token never-expiring access (clears any expiry date)
+    async def set_user_never_expires(self, user_id: int, name: str = None) -> dict:
+        now = datetime.utcnow()
+        user = await self.get_user(user_id)
+        set_fields = {"subscription_status": "active"}
+        insert_fields = {"username": None, "created_at": now}
+        if name:
+            set_fields["first_name"] = name
+        else:
+            insert_fields["first_name"] = f"User {user_id}"
+        await self.dbs["tracking"]["users"].update_one(
+            {"_id": user_id},
+            {"$set": set_fields, "$unset": {"subscription_expiry": ""}, "$setOnInsert": insert_fields},
+            upsert=True,
+        )
+        token_doc = await self.ensure_api_token_for_user(user_id, (user or {}).get("first_name"))
+        token = token_doc.get("token") if token_doc else None
+        if token:
+            await self.set_token_lifetime(token, True)
+        return {
+            "user_id": user_id,
+            "never_expires": True,
+            "token": token,
+            "addon_url": (
+                f"{SettingsManager.current().base_url}/stremio/{token}/manifest.json" if token else None
+            ),
         }
 
     #-----
@@ -1058,6 +1123,34 @@ class Database:
         size_str = get_readable_file_size(total_bytes)
         return encoded, size_str
 
+    async def get_media_ids_by_part(
+        self, channel: int, msg_id: int
+    ) -> Optional[Tuple[Optional[str], Optional[int]]]:
+        try:
+            legacy_hash = await encode_string({"chat_id": channel, "msg_id": msg_id})
+        except Exception:
+            legacy_hash = None
+
+        part_match = {"$elemMatch": {"chat_id": channel, "msg_id": msg_id}}
+        projection = {"imdb_id": 1, "tmdb_id": 1}
+
+        for i in range(1, self.current_db_index + 1):
+            db = self.dbs[f"storage_{i}"]
+
+            movie_or = [{"telegram.parts": part_match}]
+            tv_or = [{"seasons.episodes.telegram.parts": part_match}]
+            if legacy_hash:
+                movie_or.append({"telegram.id": legacy_hash})
+                tv_or.append({"seasons.episodes.telegram.id": legacy_hash})
+
+            doc = await db["movie"].find_one({"$or": movie_or}, projection)
+            if not doc:
+                doc = await db["tv"].find_one({"$or": tv_or}, projection)
+            if doc:
+                return doc.get("imdb_id"), doc.get("tmdb_id")
+
+        return None
+
     async def remove_media_part(self, channel: int, msg_id: int) -> bool:
         try:
             legacy_hash = await encode_string({"chat_id": channel, "msg_id": msg_id})
@@ -1129,7 +1222,8 @@ class Database:
 
     async def insert_media(
         self, metadata_info: dict,
-        channel: int, msg_id: int, size: str, name: str, raw_size: int = 0
+        channel: int, msg_id: int, size: str, name: str, raw_size: int = 0,
+        status: Optional[dict] = None
     ) -> Optional[ObjectId]:
 
         group_key = metadata_info.get("group_key")
@@ -1180,7 +1274,7 @@ class Database:
                 origin_country=metadata_info.get('origin_country', []) or [],
                 telegram=[quality_detail]
             )
-            return await self.update_movie(media)
+            return await self.update_movie(media, status)
         else:
             tv_show = TVShowSchema(
                 tmdb_id=metadata_info['tmdb_id'],
@@ -1212,7 +1306,7 @@ class Database:
                     )]
                 )]
             )
-            return await self.update_tv_show(tv_show)
+            return await self.update_tv_show(tv_show, status)
 
     async def _delete_split_part(self, part: dict) -> None:
         try:
@@ -1263,8 +1357,23 @@ class Database:
             result.append(quality_to_update)
         return result
 
+    #----- Identity of a non-split stream for duplicate protection (quality + name + size)
+    @staticmethod
+    def _dup_key(quality: dict) -> tuple:
+        name = re.sub(r"\s+", " ", str(quality.get("name") or "").strip().lower())
+        size = str(quality.get("size") or "").strip().lower()
+        return (quality.get("quality"), name, size)
+
+    @staticmethod
+    def _is_personal_tmdb(tmdb_id) -> bool:
+        try:
+            return int(tmdb_id) < 0
+        except (TypeError, ValueError):
+            return False
+
     async def _apply_quality_update(
-        self, existing_qualities: List[dict], quality_to_update: dict
+        self, existing_qualities: List[dict], quality_to_update: dict,
+        is_personal: bool = False, status: Optional[dict] = None
     ) -> List[dict]:
         target_quality = quality_to_update.get("quality")
         incoming_group_key = quality_to_update.get("group_key")
@@ -1300,11 +1409,19 @@ class Database:
             existing_qualities.append(quality_to_update)
             return existing_qualities
 
-        #----- REPLACE_MODE off: allow duplicate qualities.
+        #----- REPLACE_MODE off: skip exact duplicates when protection is on, else stack.
+        if SettingsManager.current().duplicate_protection and not is_personal:
+            key = self._dup_key(quality_to_update)
+            for q in existing_qualities:
+                if not q.get("group_key") and self._dup_key(q) == key:
+                    LOGGER.info(f"Duplicate protection: skipped existing stream '{quality_to_update.get('name')}'.")
+                    if status is not None:
+                        status["duplicate_skipped"] = True
+                    return existing_qualities
         existing_qualities.append(quality_to_update)
         return existing_qualities
 
-    async def update_movie(self, movie_data: MovieSchema) -> Optional[ObjectId]:
+    async def update_movie(self, movie_data: MovieSchema, status: Optional[dict] = None) -> Optional[ObjectId]:
         try:
             movie_dict = movie_data.dict()
         except ValidationError as e:
@@ -1349,7 +1466,9 @@ class Database:
 
         existing_qualities = existing_movie.get("telegram", [])
 
-        existing_qualities = await self._apply_quality_update(existing_qualities, quality_to_update)
+        existing_qualities = await self._apply_quality_update(
+            existing_qualities, quality_to_update, self._is_personal_tmdb(tmdb_id), status
+        )
 
         existing_movie["telegram"] = existing_qualities
         existing_movie["updated_on"] = datetime.utcnow()
@@ -1371,7 +1490,7 @@ class Database:
             if any(keyword in str(e).lower() for keyword in ["storage", "quota"]):
                 return await self._handle_storage_error(self.update_movie, movie_data, total_storage_dbs=total_storage_dbs)
 
-    async def update_tv_show(self, tv_show_data: TVShowSchema) -> Optional[ObjectId]:
+    async def update_tv_show(self, tv_show_data: TVShowSchema, status: Optional[dict] = None) -> Optional[ObjectId]:
         try:
             tv_show_dict = tv_show_data.dict()
         except ValidationError as e:
@@ -1438,7 +1557,7 @@ class Database:
 
                 for quality in episode["telegram"]:
                     existing_episode["telegram"] = await self._apply_quality_update(
-                        existing_episode["telegram"], quality
+                        existing_episode["telegram"], quality, self._is_personal_tmdb(tmdb_id), status
                     )
 
         existing_tv["updated_on"] = datetime.utcnow()
@@ -1651,10 +1770,6 @@ class Database:
         document = await self.dbs[db_key][collection_name].find_one({"tmdb_id": int(tmdb_id)})
         return convert_objectid_to_str(document) if document else None
 
-    #----- Batch-hydrate media docs for a list of catalog item refs.
-    #----- Groups lookups by (db_index, collection) into a single $in query
-    #----- each, then returns docs in the same order as `refs`. Missing docs
-    #----- are skipped. Replaces N sequential get_document() round-trips.
     async def get_documents(self, refs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not refs:
             return []
@@ -1816,13 +1931,18 @@ class Database:
 
         return None
 
-    async def delete_media_by_stream_id(self, stream_id_hash: str) -> bool:
+    async def delete_media_by_stream_id(self, stream_id_hash: str, delete_file: bool = False) -> bool:
         for i in range(1, self.current_db_index + 1):
             db = self.dbs[f"storage_{i}"]
             
             #----- Check Movies
             movie = await db["movie"].find_one({"telegram.id": stream_id_hash})
             if movie:
+                if delete_file:
+                    for q in movie.get("telegram", []):
+                        if q.get("id") == stream_id_hash:
+                            await self._queue_quality_deletion(q)
+                            break
                 movie["telegram"] = [q for q in movie.get("telegram", []) if q.get("id") != stream_id_hash]
                 if len(movie["telegram"]) == 0:
                     await db["movie"].delete_one({"_id": movie["_id"]})
@@ -1839,6 +1959,8 @@ class Database:
                     for episode in season.get("episodes", []):
                         for q in episode.get("telegram", []):
                             if q.get("id") == stream_id_hash:
+                                if delete_file:
+                                    await self._queue_quality_deletion(q)
                                 episode["telegram"] = [t for t in episode.get("telegram", []) if t.get("id") != stream_id_hash]
                                 if len(episode["telegram"]) == 0:
                                     season["episodes"] = [e for e in season.get("episodes", []) if e.get("episode_number") != episode.get("episode_number")]
@@ -1938,7 +2060,7 @@ class Database:
     #----- API Token Methods
     #-----
 
-    async def add_api_token(self, name: str, daily_limit_gb: float = None, monthly_limit_gb: float = None, user_id: int = None) -> dict:
+    async def add_api_token(self, name: str, daily_limit_gb: float = None, monthly_limit_gb: float = None, user_id: int = None, subscription_exempt: bool = False) -> dict:
         #----- If a user_id is provided, return existing token if already created
         if user_id:
             existing = await self.dbs["tracking"]["api_tokens"].find_one({"user_id": user_id})
@@ -1947,11 +2069,14 @@ class Database:
 
         alphabet = string.ascii_letters + string.digits
         token = ''.join(secrets.choice(alphabet) for _ in range(32))
-        
+
         token_doc = {
             "name": name,
             "token": token,
             "user_id": user_id,
+            "is_admin": self._is_owner(user_id),
+            "subscription_exempt": bool(subscription_exempt),
+            "expires_at": None,
             "created_at": datetime.utcnow(),
             "limits": {
                 "daily_limit_gb": daily_limit_gb if daily_limit_gb else 0,
@@ -1963,12 +2088,96 @@ class Database:
                 "monthly": {"month": datetime.now(timezone.utc).strftime("%Y-%m"), "bytes": 0}
             }
         }
-        
+
         await self.dbs["tracking"]["api_tokens"].insert_one(token_doc)
         return convert_objectid_to_str(token_doc)
 
+    #----- Return the user's token, creating one if none exists
+    async def ensure_api_token_for_user(self, user_id: int, name: str = None) -> Optional[dict]:
+        if not user_id:
+            return None
+        existing = await self.dbs["tracking"]["api_tokens"].find_one({"user_id": user_id})
+        if existing:
+            return convert_objectid_to_str(existing)
+        return await self.add_api_token(name or f"User {user_id}", user_id=user_id)
+
+    async def align_token_with_subscription(self, user_id: int) -> None:
+        if not SettingsManager.current().subscription:
+            return
+        doc = await self.dbs["tracking"]["api_tokens"].find_one({"user_id": user_id})
+        if doc:
+            await self.dbs["tracking"]["api_tokens"].update_one(
+                {"_id": doc["_id"]},
+                {"$set": {"subscription_exempt": False, "expires_at": None}},
+            )
+
+    #----- Toggle a token's lifetime (subscription-exempt) flag
+    async def set_token_lifetime(self, token: str, exempt: bool) -> bool:
+        result = await self.dbs["tracking"]["api_tokens"].update_one(
+            {"token": token}, {"$set": {"subscription_exempt": bool(exempt)}}
+        )
+        return result.modified_count > 0
+
+    #----- Set/extend/reduce a token's own expiry (used when subscription mode is off).
+    #----- 'set' with 0/None days clears the expiry (never expires).
+    async def update_token_expiry(self, token: str, action: str = "set", days: int = 0) -> Optional[dict]:
+        doc = await self.dbs["tracking"]["api_tokens"].find_one({"token": token})
+        if not doc:
+            return None
+        now = datetime.utcnow()
+        current = doc.get("expires_at")
+        if action == "set":
+            new_expiry = now + timedelta(days=days) if days and days > 0 else None
+        elif action == "extend":
+            base = current if (current and current > now) else now
+            new_expiry = base + timedelta(days=days)
+        elif action == "reduce":
+            base = current if current else now
+            new_expiry = base - timedelta(days=days)
+            if new_expiry < now:
+                new_expiry = now
+        else:
+            return None
+        await self.dbs["tracking"]["api_tokens"].update_one(
+            {"token": token},
+            {"$set": {"expires_at": new_expiry, "subscription_exempt": new_expiry is None}},
+        )
+        return await self.get_api_token(token)
+
+    #----- Mark every token that isn't linked to a user as lifetime
+    async def grant_lifetime_to_unlinked(self) -> int:
+        result = await self.dbs["tracking"]["api_tokens"].update_many(
+            {"$or": [{"user_id": None}, {"user_id": {"$exists": False}}]},
+            {"$set": {"subscription_exempt": True}},
+        )
+        return result.modified_count
+
+    #----- Count tokens that would stop working if subscription mode is enabled
+    async def count_uncovered_tokens(self) -> int:
+        tokens = await self.get_all_api_tokens()
+        now = datetime.utcnow()
+        count = 0
+        for t in tokens:
+            if t.get("is_admin") or t.get("subscription_exempt"):
+                continue
+            exp = t.get("expires_at")
+            if exp and exp > now:
+                continue  #----- token has its own live expiry (honoured in sub mode)
+            uid = t.get("user_id")
+            if not uid:
+                count += 1
+                continue
+            if not self.is_subscription_active(await self.get_user(int(uid))):
+                count += 1
+        return count
+
     async def get_api_token(self, token: str) -> Optional[dict]:
         doc = await self.dbs["tracking"]["api_tokens"].find_one({"token": token})
+        return convert_objectid_to_str(doc) if doc else None
+
+    #----- The (single) token linked to a given user_id, if any
+    async def get_api_token_by_user(self, user_id: int) -> Optional[dict]:
+        doc = await self.dbs["tracking"]["api_tokens"].find_one({"user_id": user_id})
         return convert_objectid_to_str(doc) if doc else None
 
     async def get_all_api_tokens(self) -> List[dict]:
@@ -1980,13 +2189,23 @@ class Database:
         result = await self.dbs["tracking"]["api_tokens"].delete_one({"token": token})
         return result.deleted_count > 0
 
-    async def link_token_user(self, token: str, user_id: int) -> bool:
-        #----- Link an existing token to a Telegram user_id
+    async def link_token_user(self, token: str, user_id: int, name: str = None) -> bool:
+        #----- Link an existing token to a Telegram user_id; elevate to admin when
+        #----- the linked user is the configured owner. Optionally overwrite the name.
+        update = {"user_id": user_id, "is_admin": self._is_owner(user_id)}
+        if name:
+            update["name"] = name
         result = await self.dbs["tracking"]["api_tokens"].update_one(
-            {"token": token},
-            {"$set": {"user_id": user_id}}
+            {"token": token}, {"$set": update}
         )
         return result.modified_count > 0
+
+    @staticmethod
+    def _is_owner(user_id) -> bool:
+        try:
+            return user_id is not None and int(user_id) == int(Telegram.OWNER_ID)
+        except (TypeError, ValueError):
+            return False
 
     async def update_token_usage(self, token: str, bytes_delta: int):
         today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
