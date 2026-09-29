@@ -486,7 +486,7 @@ class ScanManager:
             if _is_anime_channel(channel_int):
                 from Backend.helper.anime_parser import parse_anime_message
                 from Backend.helper.anime_mapping import map_tvdb
-                from Backend.helper.anime import search_anime
+                from Backend.helper.metadata.providers.kitsu import search_anime, get_anizip_mappings
 
                 parsed = parse_anime_message(file.file_name, message.caption)
                 title_val = parsed["title"]
@@ -495,8 +495,10 @@ class ScanManager:
                 if abs_ep is not None and title_val.lower() != "one piece":
                     try:
                         media_info = await search_anime(title_val)
-                        if media_info:
-                            anilist_id = media_info.get("id")
+                        if media_info and media_info.get("id"):
+                            doc = await get_anizip_mappings(int(media_info["id"]))
+                            if doc and "mappings" in doc:
+                                anilist_id = doc["mappings"].get("anilist_id")
                     except Exception as e:
                         LOGGER.warning(f"Failed to lookup AniList ID for '{title_val}': {e}")
                 

@@ -23,6 +23,7 @@ from Backend.helper.metadata.common import (
     resolve_cover_url,
 )
 from Backend.helper.metadata.entry import (
+    _is_anime_channel,
     analyze_metadata_failure,
     build_id_link,
     caption_with_id,
@@ -41,6 +42,7 @@ from Backend.helper.metadata.resolvers import (
 )
 
 __all__ = [
+    "_is_anime_channel",
     "COMBINED_EPISODE_BASE",
     "COMBINED_SEASON",
     "analyze_metadata_failure",

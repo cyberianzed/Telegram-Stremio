@@ -64,6 +64,7 @@ async def metadata(
     msg_id,
     override_id: str = None,
     season_hint: int = None,
+    parsed: dict = None,
 ) -> dict | None:
     if is_multipart_video(filename):
         LOGGER.info(f"Skipping {filename}: split video file not meant to be combined in Stremio")
@@ -73,11 +74,14 @@ async def metadata(
     part_number = split_info[1] if split_info else None
     parse_target = strip_part_suffix(filename) if split_info else filename
 
-    try:
-        parsed = parse_media_name(parse_target)
-    except Exception as e:
-        LOGGER.error(f"Parsing failed for {filename}: {e}\n{traceback.format_exc()}")
-        return None
+    if parsed is None:
+        try:
+            parsed = parse_media_name(parse_target)
+        except Exception as e:
+            LOGGER.error(f"Parsing failed for {filename}: {e}\n{traceback.format_exc()}")
+            return None
+    else:
+        parsed = dict(parsed)
 
     combined = parse_combined_episodes(parse_target)
 
@@ -91,6 +95,34 @@ async def metadata(
     episode = parsed.get("episode")
     year = parsed.get("year")
     quality = parsed.get("quality")
+
+    anime_channel = _is_anime_channel(channel)
+
+    # Normalise One Piece absolute episodes on anime channels to TV routing
+    if anime_channel and not combined:
+        import re
+        normalized_fn = re.sub(r"[._-]+", " ", parse_target.lower())
+        if "one piece" in normalized_fn:
+            match_before = re.search(r"\b(1\d{3})\s+one\s+piece\b", normalized_fn)
+            match_after = re.search(r"\bone\s+piece\b.*?\b(?:ep|episode\b)?\s*(1\d{3})\b", normalized_fn)
+            
+            ep_num = None
+            if match_before:
+                ep_num = int(match_before.group(1))
+            elif match_after:
+                ep_num = int(match_after.group(1))
+            else:
+                match_fallback = re.search(r"\bone\s+piece\b\s*(?:ep|episode\b)?\s*(1\d{3})\b", normalized_fn)
+                if match_fallback:
+                    ep_num = int(match_fallback.group(1))
+            
+            if ep_num is not None and 1000 <= ep_num <= 2000:
+                title = "One Piece"
+                season = 1
+                episode = ep_num
+                parsed["title"] = title
+                parsed["season"] = season
+                parsed["episode"] = episode
 
     if season_hint is not None and episode and not season and not isinstance(episode, list):
         season = season_hint
