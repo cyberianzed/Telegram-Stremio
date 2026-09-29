@@ -2,11 +2,12 @@ import asyncio
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from Backend import __version__
+from Backend.fastapi.themes import DEFAULT_THEME, DEFAULT_STYLE, get_theme
 from Backend.fastapi.routes.api_routes import (
     add_custom_catalog_item_api,
     add_subscription_plan_api,
@@ -44,6 +45,16 @@ from Backend.fastapi.routes.api_routes import (
     get_all_subscribers_api,
     get_all_tokens_api,
     get_auto_catalog_settings_api,
+    get_catalog_order_api,
+    update_catalog_order_api,
+    get_user_activity_api,
+    session_send_code_api,
+    session_verify_code_api,
+    session_verify_password_api,
+    session_status_api,
+    session_disconnect_api,
+    session_reconnect_api,
+    session_remove_api,
     get_custom_catalog_items_api,
     get_dead_links_api,
     get_media_visibility_api,
@@ -66,6 +77,7 @@ from Backend.fastapi.routes.api_routes import (
     set_manual_session_api,
     health_api,
     health_report_api,
+    version_status_api,
     setup_status_api,
     link_token_user_api,
     list_custom_catalogs_api,
@@ -104,7 +116,9 @@ from Backend.fastapi.routes.api_routes import (
 )
 from Backend.fastapi.routes.stream_routes import decay_client_failures
 from Backend.fastapi.routes.stream_routes import router as stream_router
+from Backend.fastapi.routes.cf_routes import router as cf_router
 from Backend.fastapi.routes.stremio_routes import router as stremio_router
+from Backend.fastapi.routes.webdav_routes import router as webdav_router
 from Backend.fastapi.routes.template_routes import (
     admin_access_page,
     admin_dashboard_page,
@@ -118,10 +132,8 @@ from Backend.fastapi.routes.template_routes import (
     login_post,
     logout,
     media_management_page,
-    public_status_page,
     settings_page,
     set_theme,
-    stremio_guide_page,
     tools_page,
 )
 from Backend.fastapi.security.credentials import require_auth
@@ -153,11 +165,15 @@ except Exception:
 @app.on_event("startup")
 async def _startup():
     asyncio.create_task(decay_client_failures())
+    from Backend.helper.version_check import version_check_loop
+    asyncio.create_task(version_check_loop())
 
 
 #----- Streaming and Stremio routers
 app.include_router(stream_router)
+app.include_router(cf_router)
 app.include_router(stremio_router)
+app.include_router(webdav_router)
 
 
 #----- Public routes (no authentication)
@@ -174,16 +190,100 @@ async def logout_route(request: Request):
     return await logout(request)
 
 @app.post("/set-theme")
-async def set_theme_route(request: Request, theme: str = Form(...)):
-    return await set_theme(request, theme)
+async def set_theme_route(request: Request, theme: str = Form(None), style: str = Form(None)):
+    return await set_theme(request, theme, style)
 
-@app.get("/status", response_class=HTMLResponse)
-async def public_status(request: Request):
-    return await public_status_page(request)
+@app.get("/manifest.webmanifest")
+async def pwa_manifest(request: Request):
+    theme_name = request.session.get("theme", DEFAULT_THEME)
+    style_name = request.session.get("style", DEFAULT_STYLE)
+    theme = get_theme(theme_name, style_name)
+    return JSONResponse(
+        {
+            "name": "Telegram Stremio",
+            "short_name": "TG Stremio",
+            "description": "Telegram Stremio media management",
+            "start_url": "/",
+            "scope": "/",
+            "display": "standalone",
+            "orientation": "any",
+            "background_color": theme["colors"]["background"],
+            "theme_color": theme["colors"]["primary"],
+            "icons": [
+                {
+                    "src": "/pwa-icon.svg",
+                    "sizes": "any",
+                    "type": "image/svg+xml",
+                    "purpose": "any"
+                },
+                {
+                    "src": "/pwa-icon.svg",
+                    "sizes": "any",
+                    "type": "image/svg+xml",
+                    "purpose": "maskable"
+                }
+            ]
+        },
+        media_type="application/manifest+json",
+        headers={"Cache-Control": "no-cache"}
+    )
 
-@app.get("/stremio", response_class=HTMLResponse)
-async def stremio_guide(request: Request):
-    return await stremio_guide_page(request)
+@app.get("/pwa-icon.svg")
+async def pwa_icon(request: Request):
+    theme_name = request.session.get("theme", DEFAULT_THEME)
+    style_name = request.session.get("style", DEFAULT_STYLE)
+    theme = get_theme(theme_name, style_name)
+    primary = theme["colors"]["primary"]
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">'
+        f'<rect width="512" height="512" rx="96" fill="{primary}"/>'
+        f'<path d="M200 152l176 104-176 104z" fill="white"/>'
+        f'</svg>'
+    )
+    return Response(
+        content=svg,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "no-cache"}
+    )
+
+@app.get("/sw.js")
+async def service_worker():
+    js = (
+        "self.addEventListener('install',e=>self.skipWaiting());"
+        "self.addEventListener('activate',e=>e.waitUntil(clients.claim()));"
+        "self.addEventListener('fetch',e=>e.respondWith(fetch(e.request).catch(()=>caches.match(e.request))));"
+    )
+    return Response(
+        content=js,
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"}
+    )
+
+@app.get("/status")
+async def public_status():
+    return {"status": "ok", "version": __version__}
+
+@app.get("/open/{app_name}/{media_type}/{content_id}", response_class=HTMLResponse)
+async def open_in_app(app_name: str, media_type: str, content_id: str):
+    stremio_type = "series" if media_type in ("series", "tv") else "movie"
+    web = f"https://web.stremio.com/#/detail/{stremio_type}/{content_id}/{content_id}"
+    schemes = {
+        "nuvio": f"nuvio://meta?type={stremio_type}&id={content_id}",
+        "stremio": f"stremio:///detail/{stremio_type}/{content_id}",
+    }
+    scheme = schemes.get(app_name, schemes["stremio"])
+    label = "Nuvio" if app_name == "nuvio" else "Stremio"
+    html = f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Opening {label}…</title>
+<style>body{{font-family:system-ui,-apple-system,sans-serif;background:#0f172a;color:#f8fafc;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;text-align:center}}a{{color:#60a5fa}}.b{{display:inline-block;margin-top:16px;padding:12px 22px;background:#3b82f6;color:#fff;border-radius:12px;text-decoration:none;font-weight:700}}</style>
+</head><body><div><h2>Opening in {label}…</h2>
+<p>If nothing happens, use the buttons below.</p>
+<a class="b" href="{scheme}">Open {label}</a><br>
+<a class="b" style="background:#334155" href="{web}">Open Stremio Web</a></div>
+<script>setTimeout(function(){{window.location.href="{scheme}";}},200);</script>
+</body></html>"""
+    return HTMLResponse(html)
 
 
 #----- Protected routes (authentication required)
@@ -280,6 +380,10 @@ async def get_dead_links(_: bool = Depends(require_auth)):
 @app.get("/api/admin/stream-analytics")
 async def get_stream_analytics(_: bool = Depends(require_auth)):
     return await get_stream_analytics_api()
+
+@app.get("/api/admin/user-activity")
+async def get_user_activity(page: int = 1, per_page: int = 5, _: bool = Depends(require_auth)):
+    return await get_user_activity_api(page, per_page)
 
 @app.post("/api/admin/clear-analytics")
 async def clear_analytics(_: bool = Depends(require_auth)):
@@ -532,6 +636,14 @@ async def auto_sync_custom_catalogs(
 async def auto_catalog_sync_status(_: bool = Depends(require_auth)):
     return await auto_catalog_sync_status_api()
 
+@app.get("/api/custom-catalogs-order")
+async def get_catalog_order_route(_: bool = Depends(require_auth)):
+    return await get_catalog_order_api()
+
+@app.put("/api/custom-catalogs-order")
+async def update_catalog_order_route(payload: dict, _: bool = Depends(require_auth)):
+    return await update_catalog_order_api(payload)
+
 @app.get("/api/custom-catalogs/auto-sync/settings")
 async def get_auto_catalog_settings_route(_: bool = Depends(require_auth)):
     return await get_auto_catalog_settings_api()
@@ -579,6 +691,36 @@ async def update_settings(payload: dict, _: bool = Depends(require_auth)):
     return await update_settings_api(payload)
 
 
+#----- Telegram user session login (replaces manual USER_SESSION_STRING)
+@app.get("/api/admin/settings/session")
+async def session_status(_: bool = Depends(require_auth)):
+    return await session_status_api()
+
+@app.post("/api/admin/settings/session/send-code")
+async def session_send_code(payload: dict, _: bool = Depends(require_auth)):
+    return await session_send_code_api(payload)
+
+@app.post("/api/admin/settings/session/verify-code")
+async def session_verify_code(payload: dict, _: bool = Depends(require_auth)):
+    return await session_verify_code_api(payload)
+
+@app.post("/api/admin/settings/session/verify-password")
+async def session_verify_password(payload: dict, _: bool = Depends(require_auth)):
+    return await session_verify_password_api(payload)
+
+@app.post("/api/admin/settings/session/disconnect")
+async def session_disconnect(_: bool = Depends(require_auth)):
+    return await session_disconnect_api()
+
+@app.post("/api/admin/settings/session/reconnect")
+async def session_reconnect(_: bool = Depends(require_auth)):
+    return await session_reconnect_api()
+
+@app.delete("/api/admin/settings/session")
+async def session_remove(_: bool = Depends(require_auth)):
+    return await session_remove_api()
+
+
 #----- System & Maintenance (WebUI replacement for /stats, /log, /restart bot commands)
 @app.get("/api/admin/stats")
 async def admin_db_stats(_: bool = Depends(require_auth)):
@@ -591,6 +733,10 @@ async def admin_health(_: bool = Depends(require_auth)):
 @app.get("/api/admin/health/report")
 async def admin_health_report(fresh: bool = Query(False), _: bool = Depends(require_auth)):
     return await health_report_api(force=fresh)
+
+@app.get("/api/admin/version")
+async def admin_version(force: bool = Query(False), _: bool = Depends(require_auth)):
+    return await version_status_api(force=force)
 
 @app.get("/api/admin/setup-status")
 async def admin_setup_status(_: bool = Depends(require_auth)):
@@ -706,4 +852,14 @@ async def tools_duplicates_purge(payload: dict | None = None, _: bool = Depends(
 
 @app.exception_handler(401)
 async def auth_exception_handler(request: Request, exc):
+    # API / stream / WebDAV clients must receive a real 401, not an HTML login redirect.
+    path = request.url.path or ""
+    if path.startswith(("/webdav", "/dl/", "/sub/", "/stremio/", "/api/", "/thumb/")):
+        from fastapi.responses import JSONResponse
+        detail = getattr(exc, "detail", "Unauthorized")
+        headers = {}
+        # Preserve WWW-Authenticate for WebDAV Basic auth prompts
+        if hasattr(exc, "headers") and exc.headers:
+            headers.update(exc.headers)
+        return JSONResponse(status_code=401, content={"detail": detail}, headers=headers)
     return RedirectResponse(url="/login", status_code=302)
